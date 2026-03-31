@@ -7,7 +7,44 @@ Independent AI Scientist workbench for `paper` and `mle` jobs.
 ```bash
 uv sync
 uv run aisci --help
+./.venv/bin/aisci --help
 uv run aisci serve --host 127.0.0.1 --port 8080
+```
+
+## Runtime Config File
+
+The CLI now auto-loads environment variables from the first matching files it
+finds in the repo root or current directory:
+
+- `.env`
+- `.env.aisci`
+- `.env.local`
+
+Use `.env.example` as the template, then run the CLI directly without an extra wrapper script.
+
+`scripts/run_paper_job.sh` remains available, but it is only a thin wrapper over `aisci paper run --wait`.
+
+Recommended mental model:
+
+- `AISCI_OUTPUT_ROOT`: where runtime outputs go, including `jobs/`, `export/`, and `.aisci/`
+- `AISCI_REPO_ROOT`: where the AiScientist repo itself lives, used to find `config/`, `src/`, and Web templates
+
+Most users only need `AISCI_OUTPUT_ROOT`. `AISCI_REPO_ROOT` is usually unnecessary unless you launch the installed CLI from outside the repo and the process cannot infer where the checked-out AiScientist source tree is.
+
+LLM selection is driven by a YAML registry rather than hardcoded string parsing.
+The default registry lives at `config/llm_profiles.yaml` in the repo root.
+Users are expected to edit that top-level `config/` file directly rather than touching `src/...` internals.
+If you want to maintain your own profile set, point `AISCI_LLM_PROFILE_FILE` at a custom YAML file.
+
+Sandbox runtime image selection is also driven by a YAML registry.
+The default registry lives at `config/image_profiles.yaml` in the repo root.
+If you want to maintain your own image profile set, point `AISCI_IMAGE_PROFILE_FILE` at a custom YAML file.
+The checked-in default `paper` profile assumes a locally prebuilt `aisci-paper:latest` image.
+
+You can also point to a custom file explicitly:
+
+```bash
+./.venv/bin/aisci --env-file /abs/path/to/paper.env paper doctor
 ```
 
 ## Paper Mode Prerequisites
@@ -16,34 +53,47 @@ uv run aisci serve --host 127.0.0.1 --port 8080
 
 - Python `>=3.12`
 - Docker daemon is reachable from the host
-- `OPENAI_API_KEY` or `AZURE_OPENAI_API_KEY` is set in the host environment
+- the selected `--llm-profile` has all required backend env vars set in the host environment
 
 Optional but recommended:
 
+- `AISCI_OUTPUT_ROOT`: override where jobs, exports, and `.aisci/` state are written
+- `AISCI_LLM_PROFILE_FILE`: optional override for the LLM profile registry YAML
 - `AISCI_MAX_STEPS`: overrides the default paper loop step budget (`80`)
 - `AISCI_REMINDER_FREQ`: overrides the default reminder interval (`5`)
-- `AISCI_REPO_ROOT`: override repo root detection if you are not running commands from the repo root
+- `AISCI_IMAGE_PROFILE_FILE`: optional override for the runtime image profile YAML
+- `AISCI_REPO_ROOT`: advanced override for locating repo-local assets such as `config/` and Web templates
 
 Sanity-check the local environment before running:
 
 ```bash
 uv run aisci paper doctor
+./.venv/bin/aisci paper doctor
 ```
 
 ## Paper Job Runtime Model
 
-Current `paper` runs use a single Docker work environment:
+Current `paper` runs use a host-agent + Docker-sandbox split:
 
-- Default Dockerfile: `docker/paper-agent.Dockerfile`
-- Main loop: runs `python -m aisci_domain_paper.orchestrator`
-- Final validation: if enabled, starts a fresh container from the same image and runs `bash reproduce.sh`
+- The `aisci` worker process on the host runs the main agent loop and all subagents.
+- A persistent Docker container is started as the code-execution sandbox.
+- The host agent talks to that sandbox through shell/file operations.
+- Final validation, if enabled, starts a fresh container from the same image and runs `bash reproduce.sh`.
+- `src/aisci_domain_paper/orchestrator.py` is no longer the paper runtime entrypoint.
 
-Inside the container the canonical paths are:
+The sandbox still uses these canonical paths:
 
 - `/home/paper`: staged paper inputs
 - `/home/submission`: working repo and final `reproduce.sh`
 - `/home/agent`: analysis and planning artifacts
 - `/home/logs`: agent/runtime logs
+
+This means:
+
+- LLM keys stay on the host.
+- `config/llm_profiles.yaml` is only read on the host.
+- Docker only needs to execute commands and hold the isolated workspace.
+- The run records both `workspace/agent/resolved_llm_config.json` and `state/sandbox_session.json` for debugging.
 
 ## Paper CLI
 
@@ -51,6 +101,7 @@ The main entrypoint is:
 
 ```bash
 uv run aisci paper run [OPTIONS]
+./.venv/bin/aisci paper run [OPTIONS]
 ```
 
 At least one of the following inputs must be provided:
@@ -61,7 +112,7 @@ At least one of the following inputs must be provided:
 
 Other `paper run` options exposed by the current CLI:
 
-- `--llm-profile TEXT`: default `gpt-5.4-responses`
+- `--llm-profile TEXT`: profile key from the YAML registry; if omitted, the registry's `defaults.paper` value is used
 - `--gpus INT`: default `0`
 - `--time-limit TEXT`: default `24h`; parsed from units like `30m`, `8h`, `1d12h`
 - `--inputs-zip PATH`: extra context bundle extracted into `/home/paper`
@@ -69,7 +120,8 @@ Other `paper run` options exposed by the current CLI:
 - `--blacklist-path PATH`: copied to `/home/paper/blacklist.txt`
 - `--addendum-path PATH`: copied to `/home/paper/addendum.md`
 - `--submission-seed-repo-zip PATH`: extracted into `/home/submission`
-- `--dockerfile PATH`: advanced override; if omitted, the default paper work-environment image is used
+- `--image TEXT`: Docker image ref for the sandbox runtime
+- `--pull-policy TEXT`: one of `if-missing`, `always`, or `never`; if omitted, the selected image profile decides
 - `--supporting-materials PATH`: repeatable option; each file is copied into `/home/paper`
 - `--run-final-validation` / `--skip-final-validation`: default is enabled
 - `--detach` / `--wait`: default is detached
@@ -86,9 +138,12 @@ If you need to change those values today, use the Web form or construct the `Job
 Minimal run with a PDF:
 
 ```bash
-export OPENAI_API_KEY=...
+cp .env.example .env
+# edit .env and fill OPENAI_API_KEY or AZURE_OPENAI_API_KEY
 
-uv run aisci paper run \
+./docker/build_paper_image.sh
+
+./.venv/bin/aisci paper run \
   --pdf /abs/path/to/paper.pdf \
   --wait
 ```
@@ -96,7 +151,7 @@ uv run aisci paper run \
 A more complete run with staged context:
 
 ```bash
-uv run aisci paper run \
+./.venv/bin/aisci paper run \
   --pdf /abs/path/to/paper.pdf \
   --inputs-zip /abs/path/to/context_bundle.zip \
   --rubric-path /abs/path/to/rubric.json \
@@ -105,14 +160,91 @@ uv run aisci paper run \
   --supporting-materials /abs/path/to/notes.md \
   --supporting-materials /abs/path/to/diagram.png \
   --time-limit 12h \
-  --llm-profile gpt-5.4-responses \
+  --llm-profile gpt-5.4 \
+  --pull-policy if-missing \
   --wait
 ```
+
+If `--image` is omitted, `aisci` resolves the default runtime image from `config/image_profiles.yaml`.
+The checked-in default points to `aisci-paper:latest`, which is what `docker/build_paper_image.sh` produces.
+If you publish your sandbox image to a registry, either pass `--image <registry-ref>` directly or update `config/image_profiles.yaml`.
+
+## LLM Profiles
+
+The default registry schema is:
+
+```yaml
+defaults:
+  paper: gpt-5.4
+  mle: gpt-5.4
+
+backends:
+  openai:
+    type: openai
+    env:
+      api_key:
+        var: OPENAI_API_KEY
+        required: true
+      base_url:
+        var: OPENAI_BASE_URL
+  azure-openai:
+    type: azure-openai
+    env:
+      endpoint:
+        var: AZURE_OPENAI_ENDPOINT
+        required: true
+      api_key:
+        var: AZURE_OPENAI_API_KEY
+        required: true
+      api_version:
+        var: OPENAI_API_VERSION
+        required: true
+
+profiles:
+  gpt-5.4:
+    backend: openai
+    model: gpt-5.4
+    api: responses
+    limits:
+      max_completion_tokens: 131072
+      context_window: 1000000
+    features:
+      use_phase: true
+
+  glm-5:
+    backend: azure-openai
+    model: glm-5
+    api: completions
+    limits:
+      max_completion_tokens: 65536
+      context_window: 202752
+    features:
+      clear_thinking: true
+```
+
+Here `context_window` means the model's maximum context window. The runtime
+derives its internal prune budget automatically; users do not need to configure
+that separately.
+
+Current provider backends supported by the code are:
+
+- `openai`
+- `azure-openai`
+
+Current API modes supported by the code are:
+
+- `responses`
+- `completions`
+
+For the default repo config, the only built-in model choices are:
+
+- `gpt-5.4`
+- `glm-5`
 
 If you prefer background execution:
 
 ```bash
-uv run aisci paper run --pdf /abs/path/to/paper.pdf
+./.venv/bin/aisci paper run --pdf /abs/path/to/paper.pdf
 ```
 
 Detached mode returns JSON containing the new `job_id`. Use that `job_id` for inspection commands below.
@@ -191,7 +323,7 @@ The Web form currently exposes a few `paper` fields that the CLI does not, inclu
 
 ## Output Layout
 
-Each run writes under `jobs/<job_id>/`:
+Each run writes under `${AISCI_OUTPUT_ROOT:-<repo_root>}/jobs/<job_id>/`:
 
 - `input/`: copied raw inputs
 - `workspace/paper/`: staged paper materials

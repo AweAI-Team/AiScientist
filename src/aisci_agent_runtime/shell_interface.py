@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 import structlog
 
@@ -30,13 +31,38 @@ class ShellResult:
     exit_code: int
 
 
+@runtime_checkable
+class ComputerInterface(Protocol):
+    def send_shell_command(self, cmd: str, timeout: int = 300) -> ShellResult:
+        ...
+
+    def read_file(self, path: str) -> str:
+        ...
+
+    def download(self, path: str) -> bytes:
+        ...
+
+    def write_file(self, path: str, content: str) -> None:
+        ...
+
+    def upload(self, data: bytes, path: str) -> None:
+        ...
+
+    def append_file(self, path: str, content: str) -> None:
+        ...
+
+    def file_exists(self, path: str) -> bool:
+        ...
+
+
 class ShellInterface:
     """
     Local shell execution interface — drop-in for ComputerInterface.
 
-    Since the agent runs inside the MLE-Bench Docker container, we execute
-    commands directly via subprocess.  The two-layer timeout pattern from
-    PaperBench ``send_shell_command_with_timeout`` is preserved.
+    This variant is for runtimes where the agent and the sandboxed workspace
+    share the same process environment, so commands can be executed directly via
+    subprocess. The two-layer timeout pattern from PaperBench
+    ``send_shell_command_with_timeout`` is preserved.
     """
 
     def __init__(self, working_dir: str = "/home"):
@@ -46,7 +72,7 @@ class ShellInterface:
     # Command execution
     # ------------------------------------------------------------------ #
 
-    def send_command(self, cmd: str, timeout: int = 300) -> ShellResult:
+    def send_shell_command(self, cmd: str, timeout: int = 300) -> ShellResult:
         """
         Execute *cmd* under ``bash -c`` with two-layer timeout.
 
@@ -82,6 +108,9 @@ class ShellInterface:
             )
         except Exception as e:
             return ShellResult(output=f"ERROR: {e}", exit_code=1)
+
+    def send_command(self, cmd: str, timeout: int = 300) -> ShellResult:
+        return self.send_shell_command(cmd, timeout=timeout)
 
     # ------------------------------------------------------------------ #
     # File I/O  (mirrors ComputerInterface upload / download)
@@ -129,13 +158,13 @@ def _shell_quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
-# Commands like ``pkill -f python`` match the orchestrator's own process
-# (python …/orchestrator.py) and cause immediate SIGTERM (exit 143).  Refuse
-# broad kills and tell the model to use a narrow pattern or PID-based kill.
+# Commands like ``pkill -f python`` match the agent's own Python process and
+# cause immediate SIGTERM (exit 143). Refuse broad kills and tell the model to
+# use a narrow pattern or PID-based kill.
 _REFUSE_BROAD_PYTHON_KILL_MSG = """\
 REFUSED: This command would match the agent's own Python process and terminate the run (SIGTERM / exit 143).
 
-The orchestrator and subagents run in the same container as Python processes. \
+The active agent loop and subagents are Python processes in this runtime. \
 ``pkill -f python`` / ``killall python`` / broad ``pkill python`` will kill them too.
 
 To free GPU memory safely, use a **narrow** match or **PID** only, e.g.:
@@ -153,7 +182,7 @@ def _refuse_broad_python_kill(cmd: str) -> str | None:
 
     Catches: pkill python, pkill -9 python, pkill -f python, pkill -f "python",
     killall python, etc.
-    (pkill -9 python was not caught by the original regex and killed orchestrator
+    (pkill -9 python was not caught by the original regex and killed the agent
     in jigsaw impl_006.)
     """
     if not cmd.strip():

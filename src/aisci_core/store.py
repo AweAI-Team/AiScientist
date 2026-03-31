@@ -30,6 +30,10 @@ def _from_iso(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
 
 
+def _new_job_id(now: datetime) -> str:
+    return f"{now.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(4)}"
+
+
 class JobStore:
     def __init__(self, db_path: Path | None = None):
         self.db_path = db_path or database_path()
@@ -91,8 +95,8 @@ class JobStore:
             )
 
     def create_job(self, spec: JobSpec) -> JobRecord:
-        job_id = secrets.token_hex(8)
         now = datetime.now().astimezone()
+        job_id = _new_job_id(now)
         with self.connect() as conn:
             conn.execute(
                 """
@@ -274,4 +278,3 @@ class JobStore:
             worker_pid=row["worker_pid"],
             error=row["error"],
         )
-

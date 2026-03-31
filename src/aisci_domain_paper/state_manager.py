@@ -29,9 +29,7 @@ class PaperStateManager:
 
     def ensure_logs(self) -> None:
         self.agent_dir.mkdir(parents=True, exist_ok=True)
-        self.subagent_logs_dir.mkdir(parents=True, exist_ok=True)
-        self._ensure_log(self.impl_log_path, "Implementation Log")
-        self._ensure_log(self.exp_log_path, "Experiment Log")
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
 
     def create_session(self, kind: str, *, label: str | None = None) -> SessionInfo:
         self.subagent_logs_dir.mkdir(parents=True, exist_ok=True)

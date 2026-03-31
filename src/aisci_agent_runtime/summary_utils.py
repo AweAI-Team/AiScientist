@@ -9,8 +9,11 @@ This keeps the message-reduction behavior close to PaperBench:
 
 from __future__ import annotations
 
+import json
 import re
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -153,6 +156,9 @@ def summarize_messages(
     config: SummaryConfig,
     task_description: str = "",
     last_summary: str | None = None,
+    log_path: str | None = None,
+    step: int | None = None,
+    actor: str | None = None,
 ) -> tuple[list[dict], str | None, bool]:
     """Summarize older complete turns.
 
@@ -200,16 +206,50 @@ def summarize_messages(
         try:
             response = llm.chat([{"role": "user", "content": prompt}], tools=None)
         except Exception:
+            _log_summary_request(
+                log_path,
+                step=step,
+                actor=actor,
+                target_drop_turns=num_turns,
+                ratio=ratio,
+                num_turns=len(turns),
+                segment_text=prompt,
+                summary_text="",
+                status="llm_error",
+            )
             ratio += config.ratio_step
             continue
 
         raw_summary = (response.text_content or "").strip()
         summary = _extract_summary(raw_summary)
         if len(summary) < config.min_summary_len:
+            _log_summary_request(
+                log_path,
+                step=step,
+                actor=actor,
+                target_drop_turns=num_turns,
+                ratio=ratio,
+                num_turns=len(turns),
+                segment_text=prompt,
+                summary_text=summary,
+                status="too_short",
+            )
             ratio += config.ratio_step
             continue
         if len(summary) > config.max_summary_chars:
             summary = _truncate(summary, config.summary_truncate_chars)
+
+        _log_summary_request(
+            log_path,
+            step=step,
+            actor=actor,
+            target_drop_turns=num_turns,
+            ratio=ratio,
+            num_turns=len(turns),
+            segment_text=prompt,
+            summary_text=summary,
+            status="accepted",
+        )
 
         summary_message = {
             "role": "user",
@@ -256,6 +296,42 @@ def _extract_summary(text: str) -> str:
     if match:
         return match.group(1).strip()
     return text.strip()
+
+
+def _log_summary_request(
+    log_path: str | None,
+    *,
+    step: int | None,
+    actor: str | None,
+    target_drop_turns: int,
+    ratio: float,
+    num_turns: int,
+    segment_text: str,
+    summary_text: str,
+    status: str,
+) -> None:
+    if not log_path:
+        return
+    try:
+        path = Path(log_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": time.time(),
+            "step": step,
+            "actor": actor,
+            "status": status,
+            "N": target_drop_turns,
+            "ratio_pct": int(ratio * 100),
+            "num_turns": num_turns,
+            "segment_chars": len(segment_text),
+            "summary_chars": len(summary_text),
+            "segment_preview": segment_text[:1000] + ("..." if len(segment_text) > 1000 else ""),
+            "summary_preview": summary_text[:1000] + ("..." if len(summary_text) > 1000 else ""),
+        }
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        return
 
 
 def _truncate(text: str, limit: int) -> str:

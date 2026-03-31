@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Annotated
 
@@ -14,7 +15,9 @@ from aisci_app.presentation import (
     build_paper_job_spec,
     paper_doctor_report,
 )
-from aisci_core.models import JobStatus
+from aisci_agent_runtime.llm_profiles import default_llm_profile_name
+from aisci_core.models import JobStatus, PullPolicy
+from aisci_core.env_config import load_runtime_env
 from aisci_core.paths import ensure_job_dirs, resolve_job_paths
 from aisci_core.store import JobStore
 
@@ -32,8 +35,40 @@ app.add_typer(logs_app, name="logs")
 app.add_typer(artifacts_app, name="artifacts")
 
 
+@app.callback()
+def main(
+    env_file: Annotated[
+        str | None,
+        typer.Option(
+            "--env-file",
+            help="Load environment variables from this file before running the command. Defaults to .env/.env.aisci/.env.local in the repo root or current directory.",
+        ),
+    ] = None,
+    output_root: Annotated[
+        str | None,
+        typer.Option(
+            "--output-root",
+            help="Write jobs/, export/, and .aisci state under this directory for this invocation.",
+        ),
+    ] = None,
+) -> None:
+    load_runtime_env(env_file)
+    if output_root:
+        os.environ["AISCI_OUTPUT_ROOT"] = str(Path(output_root).expanduser().resolve())
+
+
 def _print_json(payload: object) -> None:
     typer.echo(json.dumps(payload, indent=2, default=str))
+
+
+def _parse_gpu_ids(raw: str | None) -> list[str]:
+    if raw is None:
+        return []
+    values = [item.strip() for item in raw.split(",")]
+    gpu_ids = [item for item in values if item]
+    if not gpu_ids:
+        raise typer.BadParameter("--gpu-ids must contain at least one GPU id, e.g. --gpu-ids 4,5")
+    return gpu_ids
 
 
 def _get_job_or_exit(job_id: str):
@@ -132,26 +167,42 @@ def run_paper(
     pdf: Annotated[str | None, typer.Option("--pdf")] = None,
     paper_bundle_zip: Annotated[str | None, typer.Option("--paper-bundle-zip")] = None,
     paper_md: Annotated[str | None, typer.Option("--paper-md")] = None,
-    llm_profile: Annotated[str, typer.Option("--llm-profile")] = "gpt-5.4-responses",
+    llm_profile: Annotated[
+        str | None,
+        typer.Option("--llm-profile", help="Profile key from the LLM profiles YAML registry."),
+    ] = None,
     gpus: Annotated[int, typer.Option("--gpus")] = 0,
+    gpu_ids_raw: Annotated[
+        str | None,
+        typer.Option("--gpu-ids", help="Comma-separated GPU device ids, e.g. 4,5. Use this to pin specific GPUs."),
+    ] = None,
     time_limit: Annotated[str, typer.Option("--time-limit")] = "24h",
+    image: Annotated[str | None, typer.Option("--image", help="Docker image ref for the sandbox runtime.")] = None,
+    pull_policy: Annotated[
+        PullPolicy | None,
+        typer.Option("--pull-policy", help="Image pull policy: if-missing, always, or never."),
+    ] = None,
     inputs_zip: Annotated[str | None, typer.Option("--inputs-zip")] = None,
     rubric_path: Annotated[str | None, typer.Option("--rubric-path")] = None,
     blacklist_path: Annotated[str | None, typer.Option("--blacklist-path")] = None,
     addendum_path: Annotated[str | None, typer.Option("--addendum-path")] = None,
     seed_repo_zip: Annotated[str | None, typer.Option("--submission-seed-repo-zip")] = None,
-    dockerfile: Annotated[str | None, typer.Option("--dockerfile")] = None,
     supporting_materials: Annotated[list[str] | None, typer.Option("--supporting-materials")] = None,
     run_final_validation: Annotated[bool, typer.Option("--run-final-validation/--skip-final-validation")] = True,
     detach: Annotated[bool, typer.Option("--detach/--wait")] = True,
 ) -> None:
     service = JobService()
+    selected_llm_profile = llm_profile or default_llm_profile_name("paper")
+    gpu_ids = _parse_gpu_ids(gpu_ids_raw)
+    if gpu_ids and gpus > 0:
+        raise typer.BadParameter("Use either --gpus <count> or --gpu-ids <id,id>, not both.")
     spec = build_paper_job_spec(
         pdf_path=pdf,
         paper_bundle_zip=paper_bundle_zip,
         paper_md_path=paper_md,
-        llm_profile=llm_profile,
+        llm_profile=selected_llm_profile,
         gpus=gpus,
+        gpu_ids=gpu_ids,
         time_limit=time_limit,
         inputs_zip=inputs_zip,
         rubric_path=rubric_path,
@@ -159,7 +210,8 @@ def run_paper(
         addendum_path=addendum_path,
         seed_repo_zip=seed_repo_zip,
         supporting_materials=supporting_materials or [],
-        dockerfile=dockerfile,
+        image=image,
+        pull_policy=pull_policy,
         run_final_validation=run_final_validation,
     )
     job = service.create_job(spec)
@@ -233,14 +285,29 @@ def run_mle(
     validation_command: Annotated[str | None, typer.Option("--validation-command")] = None,
     grading_config_path: Annotated[str | None, typer.Option("--grading-config-path")] = None,
     metric_direction: Annotated[str | None, typer.Option("--metric-direction")] = None,
-    llm_profile: Annotated[str, typer.Option("--llm-profile")] = "gpt-5.4-responses",
+    llm_profile: Annotated[
+        str | None,
+        typer.Option("--llm-profile", help="Profile key from the LLM profiles YAML registry."),
+    ] = None,
     gpus: Annotated[int, typer.Option("--gpus")] = 0,
+    gpu_ids_raw: Annotated[
+        str | None,
+        typer.Option("--gpu-ids", help="Comma-separated GPU device ids, e.g. 4,5. Use this to pin specific GPUs."),
+    ] = None,
     time_limit: Annotated[str, typer.Option("--time-limit")] = "24h",
-    dockerfile: Annotated[str | None, typer.Option("--dockerfile")] = None,
+    image: Annotated[str | None, typer.Option("--image", help="Docker image ref for the sandbox runtime.")] = None,
+    pull_policy: Annotated[
+        PullPolicy | None,
+        typer.Option("--pull-policy", help="Image pull policy: if-missing, always, or never."),
+    ] = None,
     run_final_validation: Annotated[bool, typer.Option("--run-final-validation")] = False,
     detach: Annotated[bool, typer.Option("--detach/--wait")] = True,
 ) -> None:
     service = JobService()
+    selected_llm_profile = llm_profile or default_llm_profile_name("mle")
+    gpu_ids = _parse_gpu_ids(gpu_ids_raw)
+    if gpu_ids and gpus > 0:
+        raise typer.BadParameter("Use either --gpus <count> or --gpu-ids <id,id>, not both.")
     spec = build_mle_job_spec(
         workspace_zip=workspace_zip,
         competition_bundle_zip=competition_bundle_zip,
@@ -251,10 +318,12 @@ def run_mle(
         validation_command=validation_command,
         grading_config_path=grading_config_path,
         metric_direction=metric_direction,
-        llm_profile=llm_profile,
+        llm_profile=selected_llm_profile,
         gpus=gpus,
+        gpu_ids=gpu_ids,
         time_limit=time_limit,
-        dockerfile=dockerfile,
+        image=image,
+        pull_policy=pull_policy,
         run_final_validation=run_final_validation,
     )
     job = service.create_job(spec)

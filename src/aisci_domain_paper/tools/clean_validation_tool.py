@@ -40,12 +40,12 @@ class CleanReproduceValidationTool(Tool):
 
         cleanup_lines: list[str] = []
         for command in CLEANUP_COMMANDS:
-            result = shell.send_command(command, timeout=300)
+            result = shell.send_shell_command(command, timeout=300)
             status = "ok" if result.exit_code == 0 else f"exit={result.exit_code}"
             cleanup_lines.append(f"$ {command}\n[{status}]\n{result.output.strip()}".strip())
         cleanup_summary = "\n\n".join(cleanup_lines).strip()
 
-        hardcoded_result = shell.send_command(
+        hardcoded_result = shell.send_shell_command(
             "grep -rn '/home/submission' /home/submission/src/ /home/submission/*.py /home/submission/scripts/*.sh 2>/dev/null || true",
             timeout=20,
         )

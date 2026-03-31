@@ -1,0 +1,54 @@
+version: 1
+
+defaults:
+  default: glm-5
+  paper: glm-5
+  mle: glm-5
+
+backends:
+  openai:
+    type: openai
+    env:
+      api_key:
+        var: OPENAI_API_KEY
+        required: true
+      base_url:
+        var: OPENAI_BASE_URL
+      organization:
+        var: OPENAI_ORG_ID
+      project:
+        var: OPENAI_PROJECT
+
+  azure-openai:
+    type: azure-openai
+    env:
+      endpoint:
+        var: AZURE_OPENAI_ENDPOINT
+        required: true
+      api_key:
+        var: AZURE_OPENAI_API_KEY
+        required: true
+      api_version:
+        var: OPENAI_API_VERSION
+        required: true
+
+profiles:
+  gpt-5.4:
+    backend: openai
+    model: gpt-5.4
+    api: responses
+    limits:
+      max_completion_tokens: 131072
+      context_window: 1000000
+    features:
+      use_phase: true
+
+  glm-5:
+    backend: azure-openai
+    model: glm-5
+    api: completions
+    limits:
+      max_completion_tokens: 65536
+      context_window: 202752
+    features:
+      clear_thinking: true

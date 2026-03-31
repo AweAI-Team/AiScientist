@@ -59,7 +59,7 @@ class BashToolWithTimeout(Tool):
             timeout = self.default_timeout
         timeout = min(int(timeout), self.max_timeout)
 
-        result = shell.send_command(command, timeout=timeout)
+        result = shell.send_shell_command(command, timeout=timeout)
         output = _truncate_output(result.output)
 
         if result.exit_code == 137:
@@ -125,7 +125,7 @@ class PythonTool(Tool):
 
         escaped = code.replace("'", "'\\''")
         cmd = f"python3 -c '{escaped}'"
-        result = shell.send_command(cmd, timeout=timeout)
+        result = shell.send_shell_command(cmd, timeout=timeout)
         return _truncate_output(result.output)
 
     def get_tool_schema(self) -> dict:
@@ -173,8 +173,10 @@ class ReadFileChunkTool(Tool):
         # Cap num_lines to a sane maximum so the model cannot accidentally
         # request millions of lines and destroy the context.
         num_lines = min(int(num_lines), 2000)
+        if not shell.file_exists(path):
+            return f"File not found: {path}. It may be optional or not staged for this run."
         cmd = f"sed -n '{start_line},{start_line + num_lines - 1}p' {shlex.quote(path)}"
-        result = shell.send_command(cmd, timeout=30)
+        result = shell.send_shell_command(cmd, timeout=30)
         if result.exit_code != 0:
             return f"Error reading {path}: {result.output}"
         # Add line numbers
@@ -221,10 +223,12 @@ class SearchFileTool(Tool):
         return "search_file"
 
     def execute(self, shell, pattern: str, path: str = ".", include: str = "", **kwargs) -> str:
+        if not shell.file_exists(path):
+            return f"File not found: {path}. It may be optional or not staged for this run."
         cmd = f"grep -rn {shlex.quote(pattern)} {shlex.quote(path)}"
         if include:
             cmd = f"grep -rn --include={shlex.quote(include)} {shlex.quote(pattern)} {shlex.quote(path)}"
-        result = shell.send_command(cmd, timeout=60)
+        result = shell.send_shell_command(cmd, timeout=60)
         return _truncate_output(result.output) if result.output.strip() else "No matches found."
 
     def get_tool_schema(self) -> dict:
@@ -283,7 +287,7 @@ class FileEditTool(Tool):
         if command == "str_replace":
             if not old_str:
                 return "Error: old_str is required for str_replace"
-            if not os.path.exists(path):
+            if not shell.file_exists(path):
                 return f"Error: {path} does not exist"
 
             content = shell.read_file(path)
@@ -304,7 +308,7 @@ class FileEditTool(Tool):
             return f"Replaced in {path}"
 
         if command == "insert":
-            if not os.path.exists(path):
+            if not shell.file_exists(path):
                 return f"Error: {path} does not exist"
             content = shell.read_file(path)
             lines = content.split("\n")
@@ -381,7 +385,7 @@ class GitCommitTool(Tool):
         repo = "/home/code"
 
         # Ensure git is initialised
-        shell.send_command(f"cd {repo} && git init 2>/dev/null", timeout=10)
+        shell.send_shell_command(f"cd {repo} && git init 2>/dev/null", timeout=10)
 
         # Ensure .gitignore exists
         gitignore_path = f"{repo}/.gitignore"
@@ -393,7 +397,7 @@ class GitCommitTool(Tool):
         shell.write_file(msg_path, message)
 
         # Stage & commit
-        result = shell.send_command(
+        result = shell.send_shell_command(
             f"cd {repo} && git add -A && git commit -F {msg_path} 2>&1",
             timeout=60,
         )
@@ -462,7 +466,7 @@ class ExecCommandTool(Tool):
         run_id = f"run_{self._run_counter:03d}"
         log_dir = f"/home/agent/experiments/{task_id}"
         log_path = f"{log_dir}/{run_id}.log"
-        shell.send_command(f"mkdir -p {log_dir}", timeout=10)
+        shell.send_shell_command(f"mkdir -p {log_dir}", timeout=10)
 
         # Run with pipefail and tee to log
         wrapped = (
@@ -470,7 +474,7 @@ class ExecCommandTool(Tool):
             f"{{ {command} ; }} 2>&1 | tee {shlex.quote(log_path)}"
         )
         t0 = time.time()
-        result = shell.send_command(wrapped, timeout=timeout)
+        result = shell.send_shell_command(wrapped, timeout=timeout)
         duration = time.time() - t0
 
         output = _truncate_output(result.output)
@@ -540,7 +544,7 @@ class AddImplLogTool(Tool):
         entry = "\n".join(entry_parts)
 
         safe = shlex.quote(entry)
-        shell.send_command(
+        shell.send_shell_command(
             f"mkdir -p /home/agent && printf '%s' {safe} >> {self.LOG_PATH}",
             timeout=10,
         )
@@ -613,7 +617,7 @@ class AddExpLogTool(Tool):
         entry = "\n".join(entry_parts)
 
         safe = shlex.quote(entry)
-        shell.send_command(
+        shell.send_shell_command(
             f"mkdir -p /home/agent && printf '%s' {safe} >> {self.LOG_PATH}",
             timeout=10,
         )

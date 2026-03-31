@@ -14,14 +14,14 @@ MAIN_AGENT_WORKSPACE_REFERENCE = """## Workspace Reference
 | `/home/paper/addendum.md` | Scope clarifications and constraints |
 | `/home/paper/blacklist.txt` | Blocked resources that must not be used |
 | `/home/submission/` | Output git repository |
-| `/home/submission/reproduce.sh` | Reproduction entry point |
-| `/home/agent/paper_analysis/` | Structured paper analysis: `summary.md`, `structure.md`, `algorithm.md`, `experiments.md`, `baseline.md` |
-| `/home/agent/prioritized_tasks.md` | Ranked implementation plan |
-| `/home/agent/plan.md` | Implementation plan and auxiliary planning output |
-| `/home/agent/impl_log.md` | Implementation changelog |
-| `/home/agent/exp_log.md` | Experiment log |
-| `/home/agent/experiments/` | Experiment command logs |
-| `/home/logs/subagent_logs/` | JSONL traces for the main agent and subagents |
+| `/home/submission/reproduce.sh` | Reproduction entry point created during implementation |
+| `/home/agent/paper_analysis/` | Structured paper analysis created by `read_paper` |
+| `/home/agent/prioritized_tasks.md` | Ranked implementation plan created by `prioritize_tasks` |
+| `/home/agent/plan.md` | Planning note created by planning work |
+| `/home/agent/impl_log.md` | Implementation changelog created on first implementation write |
+| `/home/agent/exp_log.md` | Experiment log created on first experiment write |
+| `/home/agent/experiments/` | Experiment command logs created by experiment runs |
+| `/home/logs/subagent_logs/` | Subagent trace directories created when subagents run |
 """
 
 
@@ -39,8 +39,8 @@ IMPLEMENTATION_WORKSPACE_REFERENCE = """## Workspace Reference
 | `/home/agent/paper_analysis/` | Detailed paper analysis | After `read_paper` |
 | `/home/agent/prioritized_tasks.md` | Priority-ranked task list | After `prioritize_tasks` |
 | `/home/agent/plan.md` | Implementation plan | After planning work runs |
-| `/home/agent/impl_log.md` | Implementation changelog written by you | Always |
-| `/home/agent/exp_log.md` | Experiment log written by experiment runs | Always |
+| `/home/agent/impl_log.md` | Implementation changelog written by you | After implementation work |
+| `/home/agent/exp_log.md` | Experiment log written by experiment runs | After experiment work |
 | `/home/agent/experiments/` | Experiment command logs | After `exec_command` runs |
 """
 
@@ -60,7 +60,7 @@ EXPERIMENT_WORKSPACE_REFERENCE = """## Workspace Reference
 | `/home/agent/prioritized_tasks.md` | Priority-ranked task list | After `prioritize_tasks` |
 | `/home/agent/plan.md` | Implementation plan | After planning work runs |
 | `/home/agent/impl_log.md` | Implementation changelog | After implementation work |
-| `/home/agent/exp_log.md` | Experiment log written by you | Always |
+| `/home/agent/exp_log.md` | Experiment log written by you | After experiment work |
 | `/home/agent/experiments/` | Experiment command logs | Created by `exec_command` |
 """
 

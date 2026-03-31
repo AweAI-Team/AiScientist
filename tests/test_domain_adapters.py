@@ -10,9 +10,12 @@ from aisci_core.models import (
     JobStatus,
     JobType,
     MLESpec,
+    NetworkPolicy,
     PaperSpec,
+    PullPolicy,
     RunPhase,
     RuntimeProfile,
+    UIDGIDMode,
     WorkspaceLayout,
 )
 from aisci_core.paths import ensure_job_dirs, resolve_job_paths
@@ -30,6 +33,61 @@ def _make_pdf(path: Path) -> None:
         writer.write(handle)
 
 
+def _write_llm_config(root: Path) -> None:
+    config_dir = root / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "llm_profiles.yaml").write_text(
+        """
+defaults:
+  paper: paper-default
+  mle: mle-default
+backends:
+  openai:
+    type: openai
+    env:
+      api_key:
+        var: OPENAI_API_KEY
+        required: true
+profiles:
+  paper-default:
+    backend: openai
+    model: gpt-5.4
+    api: responses
+    limits:
+      max_completion_tokens: 1024
+  mle-default:
+    backend: openai
+    model: gpt-5.4
+    api: responses
+    limits:
+      max_completion_tokens: 1024
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_image_config(root: Path) -> None:
+    config_dir = root / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "image_profiles.yaml").write_text(
+        """
+defaults:
+  paper: paper-default
+  mle: mle-default
+profiles:
+  paper-default:
+    image: registry.example/aisci-paper:latest
+    pull_policy: if-missing
+  mle-default:
+    image: registry.example/aisci-mle:latest
+    pull_policy: if-missing
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def _paper_job(tmp_path: Path, pdf_path: Path, *, run_final_validation: bool = False) -> JobRecord:
     now = __import__("datetime").datetime.now().astimezone()
     return JobRecord(
@@ -38,7 +96,7 @@ def _paper_job(tmp_path: Path, pdf_path: Path, *, run_final_validation: bool = F
         status=JobStatus.PENDING,
         phase=RunPhase.INGEST,
         objective="paper objective",
-        llm_profile="test",
+        llm_profile="paper-default",
         runtime_profile=RuntimeProfile(
             run_final_validation=run_final_validation,
             workspace_layout=WorkspaceLayout.PAPER,
@@ -57,7 +115,7 @@ def _mle_job(tmp_path: Path, bundle_path: Path) -> JobRecord:
         status=JobStatus.PENDING,
         phase=RunPhase.INGEST,
         objective="mle objective",
-        llm_profile="test",
+        llm_profile="mle-default",
         runtime_profile=RuntimeProfile(
             run_final_validation=False,
             workspace_layout=WorkspaceLayout.MLE,
@@ -71,24 +129,40 @@ def _mle_job(tmp_path: Path, bundle_path: Path) -> JobRecord:
 def test_paper_adapter_stages_artifacts(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AISCI_REPO_ROOT", str(tmp_path))
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    (tmp_path / "docker").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "docker" / "paper.Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    _write_llm_config(tmp_path)
+    _write_image_config(tmp_path)
     pdf_path = tmp_path / "sample.pdf"
     _make_pdf(pdf_path)
     runtime = DockerRuntimeManager()
     monkeypatch.setattr(runtime, "can_use_docker", lambda: True)
+    monkeypatch.setattr(runtime, "prepare_image", lambda profile, runtime_profile: "paper-image:test")  # noqa: ARG001
+    monkeypatch.setattr(
+        runtime,
+        "start_session",
+        lambda spec, image_tag: ContainerSession(  # noqa: ARG005
+            container_name="paper-test-session",
+            image_tag=image_tag,
+            profile=spec.profile,
+            runtime_profile=spec.runtime_profile,
+            workspace_layout=spec.workspace_layout,
+            mounts=spec.mounts,
+            workdir=spec.workdir,
+        ),
+    )
+    monkeypatch.setattr(runtime, "cleanup", lambda session: None)
 
-    def fake_run_real_loop(job, job_paths) -> None:  # noqa: ANN001
+    def fake_run_real_loop(job, job_paths, session, profile) -> None:  # noqa: ANN001,ARG001
         analysis_dir = job_paths.workspace_dir / "agent" / "paper_analysis"
         analysis_dir.mkdir(parents=True, exist_ok=True)
         for name in ("summary.md", "structure.md", "algorithm.md", "experiments.md", "baseline.md"):
             (analysis_dir / name).write_text(f"# {name}\n", encoding="utf-8")
         (job_paths.workspace_dir / "agent" / "prioritized_tasks.md").write_text("# priorities\n", encoding="utf-8")
         (job_paths.workspace_dir / "agent" / "plan.md").write_text("# plan\n", encoding="utf-8")
-        (job_paths.workspace_dir / "agent" / "capabilities.json").write_text("{}", encoding="utf-8")
+        (job_paths.state_dir / "capabilities.json").write_text("{}", encoding="utf-8")
+        (job_paths.state_dir / "resolved_llm_config.json").write_text("{}", encoding="utf-8")
         (job_paths.workspace_dir / "agent" / "final_self_check.md").write_text("# self-check\n", encoding="utf-8")
         (job_paths.workspace_dir / "agent" / "final_self_check.json").write_text("{}", encoding="utf-8")
-        (job_paths.workspace_dir / "agent" / "paper_main_prompt.md").write_text("# prompt\n", encoding="utf-8")
+        (job_paths.state_dir / "paper_main_prompt.md").write_text("# prompt\n", encoding="utf-8")
         (job_paths.workspace_dir / "submission" / "reproduce.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
         (job_paths.logs_dir / "agent.log").write_text("agent log\n", encoding="utf-8")
         (job_paths.logs_dir / "conversation.jsonl").write_text("{}\n", encoding="utf-8")
@@ -102,48 +176,58 @@ def test_paper_adapter_stages_artifacts(tmp_path: Path, monkeypatch) -> None:
     assert "paper_analysis" in artifact_types
     assert "prioritized_tasks" in artifact_types
     assert "capabilities" in artifact_types
+    assert "resolved_llm_config" in artifact_types
+    assert "sandbox_session" in artifact_types
     assert "self_check_report" in artifact_types
     job_paths = ensure_job_dirs(resolve_job_paths("paper-job"))
     assert (job_paths.workspace_dir / "submission" / "reproduce.sh").exists()
     assert (job_paths.workspace_dir / "agent" / "paper_analysis" / "summary.md").exists()
-    assert (job_paths.workspace_dir / "agent" / "capabilities.json").exists()
+    assert (job_paths.state_dir / "capabilities.json").exists()
     assert (job_paths.workspace_dir / "agent" / "final_self_check.md").exists()
 
 
-def test_default_paper_profile_prefers_repo_local_agent_dockerfile(tmp_path: Path, monkeypatch) -> None:
+def test_default_paper_profile_uses_repo_image_config(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AISCI_REPO_ROOT", str(tmp_path))
-    docker_dir = tmp_path / "docker"
-    docker_dir.mkdir(parents=True, exist_ok=True)
-    agent_dockerfile = docker_dir / "paper-agent.Dockerfile"
-    fallback_dockerfile = docker_dir / "paper.Dockerfile"
-    agent_dockerfile.write_text("FROM scratch\n", encoding="utf-8")
-    fallback_dockerfile.write_text("FROM busybox\n", encoding="utf-8")
+    _write_llm_config(tmp_path)
+    _write_image_config(tmp_path)
 
     profile = default_paper_profile()
 
-    assert profile.dockerfile_path == agent_dockerfile
-    assert profile.context_dir == tmp_path
-    assert profile.image_tag.startswith("aisci-paper:")
+    assert profile.image == "registry.example/aisci-paper:latest"
+    assert profile.pull_policy == PullPolicy.IF_MISSING
+
+
+def test_prepare_image_if_missing_pulls_when_absent(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AISCI_REPO_ROOT", str(tmp_path))
+    _write_image_config(tmp_path)
+    runtime = DockerRuntimeManager()
+    pulled: list[str] = []
+    monkeypatch.setattr(runtime, "image_exists", lambda image_ref: False)
+    monkeypatch.setattr(runtime, "pull_image", lambda image_ref: pulled.append(image_ref))
+
+    image_ref = runtime.prepare_image(default_paper_profile(), RuntimeProfile())
+
+    assert image_ref == "registry.example/aisci-paper:latest"
+    assert pulled == ["registry.example/aisci-paper:latest"]
 
 
 def test_paper_adapter_reuses_same_image_for_main_and_validation(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AISCI_REPO_ROOT", str(tmp_path))
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    (tmp_path / "docker").mkdir(parents=True, exist_ok=True)
-    dockerfile = tmp_path / "docker" / "paper-agent.Dockerfile"
-    dockerfile.write_text("FROM scratch\n", encoding="utf-8")
+    _write_llm_config(tmp_path)
+    _write_image_config(tmp_path)
     pdf_path = tmp_path / "sample.pdf"
     _make_pdf(pdf_path)
 
     runtime = DockerRuntimeManager()
     monkeypatch.setattr(runtime, "can_use_docker", lambda: True)
 
-    build_paths: list[Path] = []
+    prepared_images: list[str] = []
     started_specs = []
     started_tags: list[str] = []
 
-    def fake_build_profile(profile, runtime_profile):  # noqa: ANN001,ARG001
-        build_paths.append(profile.dockerfile_path)
+    def fake_prepare_image(profile, runtime_profile):  # noqa: ANN001,ARG001
+        prepared_images.append(profile.image)
         return "paper-image:123"
 
     def fake_start_session(spec, image_tag):  # noqa: ANN001
@@ -159,36 +243,46 @@ def test_paper_adapter_reuses_same_image_for_main_and_validation(tmp_path: Path,
             workdir=spec.workdir,
         )
 
-    def fake_exec(session, command, *, workdir=None, env=None, check=False):  # noqa: ANN001,ARG001
-        submission_dir = next(mount.source for mount in session.mounts if mount.target == "/home/submission")
-        if command == "python -m aisci_domain_paper.orchestrator":
-            (submission_dir / "reproduce.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-        return DockerExecutionResult(
-            command=["docker", "exec"],
+    monkeypatch.setattr(runtime, "prepare_image", fake_prepare_image)
+    monkeypatch.setattr(runtime, "start_session", fake_start_session)
+    monkeypatch.setattr(
+        runtime,
+        "exec",
+        lambda session, command, **kwargs: DockerExecutionResult(  # noqa: ARG005
+            command=["docker", "exec", command],
             exit_code=0,
             stdout="ok",
             stderr="",
-        )
-
-    monkeypatch.setattr(runtime, "build_profile", fake_build_profile)
-    monkeypatch.setattr(runtime, "start_session", fake_start_session)
-    monkeypatch.setattr(runtime, "exec", fake_exec)
+        ),
+    )
     monkeypatch.setattr(runtime, "cleanup", lambda session: None)
 
     adapter = PaperDomainAdapter(runtime)
+    monkeypatch.setattr(
+        adapter,
+        "_run_real_loop",
+        lambda job, job_paths, session, profile: (  # noqa: ARG005
+            (job_paths.workspace_dir / "submission" / "reproduce.sh").write_text(
+                "#!/usr/bin/env bash\nexit 0\n", encoding="utf-8"
+            ),
+            (job_paths.state_dir / "resolved_llm_config.json").write_text("{}", encoding="utf-8"),
+        ),
+    )
     result = adapter.run(_paper_job(tmp_path, pdf_path, run_final_validation=True))
 
     assert result["validation_report"].status == "passed"
     assert result["validation_report"].container_image == "paper-image:123"
-    assert build_paths == [dockerfile, dockerfile]
+    assert prepared_images == ["registry.example/aisci-paper:latest"]
     assert started_tags == ["paper-image:123", "paper-image:123"]
     assert len(started_specs) == 2
-    assert all(spec.profile.dockerfile_path == dockerfile for spec in started_specs)
+    assert all(spec.profile.image == "registry.example/aisci-paper:latest" for spec in started_specs)
 
 
 def test_paper_adapter_requires_docker(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AISCI_REPO_ROOT", str(tmp_path))
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    _write_llm_config(tmp_path)
+    _write_image_config(tmp_path)
     pdf_path = tmp_path / "sample.pdf"
     _make_pdf(pdf_path)
     runtime = DockerRuntimeManager()
@@ -206,8 +300,8 @@ def test_paper_adapter_requires_docker(tmp_path: Path, monkeypatch) -> None:
 def test_mle_adapter_stages_summary_and_submission(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AISCI_REPO_ROOT", str(tmp_path))
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    (tmp_path / "docker").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "docker" / "mle.Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    _write_llm_config(tmp_path)
+    _write_image_config(tmp_path)
     bundle = tmp_path / "workspace.zip"
     with ZipFile(bundle, "w") as zf:
         zf.writestr("description.md", "# task")
@@ -256,6 +350,8 @@ def test_mle_adapter_stages_summary_and_submission(tmp_path: Path, monkeypatch) 
 def test_mle_adapter_requires_docker(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AISCI_REPO_ROOT", str(tmp_path))
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    _write_llm_config(tmp_path)
+    _write_image_config(tmp_path)
     bundle = tmp_path / "workspace.zip"
     with ZipFile(bundle, "w") as zf:
         zf.writestr("description.md", "# task")
@@ -274,8 +370,7 @@ def test_mle_adapter_requires_docker(tmp_path: Path, monkeypatch) -> None:
 
 def test_runtime_session_spec_uses_canonical_mounts(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AISCI_REPO_ROOT", str(tmp_path))
-    (tmp_path / "docker").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "docker" / "mle.Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    _write_image_config(tmp_path)
     runtime = DockerRuntimeManager()
     job_paths = ensure_job_dirs(resolve_job_paths("layout-job"))
     runtime.ensure_layout(job_paths, WorkspaceLayout.MLE)
@@ -288,7 +383,89 @@ def test_runtime_session_spec_uses_canonical_mounts(tmp_path: Path, monkeypatch)
         workdir="/home/code",
     )
     targets = {mount.target for mount in spec.mounts}
-    assert "/home/data" in targets
-    assert "/home/code" in targets
-    assert "/home/submission" in targets
+    assert "/home" in targets
+    assert "/home/logs" in targets
+    assert "/workspace/logs" in targets
     assert spec.workdir == "/home/code"
+
+
+def test_start_session_applies_user_limits_network_and_labels(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AISCI_REPO_ROOT", str(tmp_path))
+    _write_image_config(tmp_path)
+    runtime = DockerRuntimeManager()
+    job_paths = ensure_job_dirs(resolve_job_paths("runtime-job"))
+    runtime.ensure_layout(job_paths, WorkspaceLayout.PAPER)
+    monkeypatch.setattr("aisci_runtime_docker.agent_session.os.getuid", lambda: 1234)
+    monkeypatch.setattr("aisci_runtime_docker.agent_session.os.getgid", lambda: 2345)
+    commands: list[list[str]] = []
+
+    def fake_run(command, check=True, timeout=None):  # noqa: ANN001,ARG001
+        commands.append(command)
+        return DockerExecutionResult(command=command, exit_code=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(runtime, "_run", fake_run)
+    spec = runtime.create_session_spec(
+        "runtime-job",
+        job_paths,
+        default_paper_profile(),
+        RuntimeProfile(
+            workspace_layout=WorkspaceLayout.PAPER,
+            uid_gid_mode=UIDGIDMode.HOST,
+            network_policy=NetworkPolicy.NONE,
+            cpu_limit="4",
+            memory_limit="8g",
+        ),
+        layout=WorkspaceLayout.PAPER,
+        workdir="/home/submission",
+    )
+
+    session = runtime.start_session(spec, "paper-image:test")
+    command = commands[0]
+
+    assert session.run_as_user == "1234:2345"
+    assert "--user" in command
+    assert "1234:2345" in command
+    assert "--cpus" in command
+    assert "4" in command
+    assert "--memory" in command
+    assert "8g" in command
+    assert "--network" in command
+    assert "none" in command
+    assert "--label" in command
+    assert "aisci.job_id=runtime-job" in command
+    assert "aisci.workspace_layout=paper" in command
+    assert "aisci.image_profile=paper-default" in command
+
+
+def test_start_session_prefers_explicit_gpu_ids(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AISCI_REPO_ROOT", str(tmp_path))
+    _write_image_config(tmp_path)
+    runtime = DockerRuntimeManager()
+    job_paths = ensure_job_dirs(resolve_job_paths("runtime-job-gpu-ids"))
+    runtime.ensure_layout(job_paths, WorkspaceLayout.PAPER)
+    commands: list[list[str]] = []
+
+    def fake_run(command, check=True, timeout=None):  # noqa: ANN001,ARG001
+        commands.append(command)
+        return DockerExecutionResult(command=command, exit_code=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(runtime, "_run", fake_run)
+    spec = runtime.create_session_spec(
+        "runtime-job-gpu-ids",
+        job_paths,
+        default_paper_profile(),
+        RuntimeProfile(
+            workspace_layout=WorkspaceLayout.PAPER,
+            gpu_count=2,
+            gpu_ids=["4", "5"],
+        ),
+        layout=WorkspaceLayout.PAPER,
+        workdir="/home/submission",
+    )
+
+    runtime.start_session(spec, "paper-image:test")
+    command = commands[0]
+
+    assert "--gpus" in command
+    assert "device=4,5" in command
+    assert "2" not in command[command.index("--gpus") + 1]

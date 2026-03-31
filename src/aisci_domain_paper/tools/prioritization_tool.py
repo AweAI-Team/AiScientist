@@ -22,8 +22,8 @@ class PrioritizeTasksTool(Tool):
         **kwargs: Any,  # noqa: ARG002
     ) -> str:
         self.engine._ensure_workspace()
-        summary_path = shell.mapped(paper_analysis_dir) / "summary.md"
-        if not summary_path.exists():
+        summary_path = f"{paper_analysis_dir.rstrip('/')}/summary.md"
+        if not shell.file_exists(summary_path):
             return (
                 f"Error: Paper analysis not found at {paper_analysis_dir}/. "
                 "Please run read_paper first to generate the paper analysis files."

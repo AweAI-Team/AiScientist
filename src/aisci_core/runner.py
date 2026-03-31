@@ -190,10 +190,14 @@ class JobRunner:
                 ("impl_log", paths.workspace_dir / "agent" / "impl_log.md", RunPhase.IMPLEMENT),
                 ("exp_log", paths.workspace_dir / "agent" / "exp_log.md", RunPhase.VALIDATE),
                 ("plan", paths.workspace_dir / "agent" / "plan.md", RunPhase.IMPLEMENT),
-                ("capabilities", paths.workspace_dir / "agent" / "capabilities.json", RunPhase.ANALYZE),
+                ("capabilities", paths.state_dir / "capabilities.json", RunPhase.ANALYZE),
+                ("resolved_llm_config", paths.state_dir / "resolved_llm_config.json", RunPhase.INGEST),
+                ("prompt", paths.state_dir / "paper_main_prompt.md", RunPhase.INGEST),
                 ("self_check_report", paths.workspace_dir / "agent" / "final_self_check.md", RunPhase.VALIDATE),
                 ("self_check_report_json", paths.workspace_dir / "agent" / "final_self_check.json", RunPhase.VALIDATE),
                 ("reproduce_script", paths.workspace_dir / "submission" / "reproduce.sh", RunPhase.FINALIZE),
+                ("orchestrator_state", paths.logs_dir / "paper_session_state.json", RunPhase.FINALIZE),
+                ("sandbox_session", paths.state_dir / "sandbox_session.json", RunPhase.FINALIZE),
             ]
             for artifact_type, path, phase in paper_files:
                 add(artifact_type, path, phase)

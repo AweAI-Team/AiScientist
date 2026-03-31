@@ -807,7 +807,7 @@ def main():
     time_limit = int(os.environ.get("TIME_LIMIT_SECS", 14400))
     max_steps = int(os.environ.get("AISCI_MAX_STEPS", 500))
     reminder_freq = int(os.environ.get("AISCI_REMINDER_FREQ", 5))
-    model = os.environ.get("AISCI_MODEL", "gpt-5.2-2025-12-11")
+    model = os.environ.get("AISCI_MODEL", "gpt-5.4")
     hardware = os.environ.get("HARDWARE", "unknown")
     # Context reduction: "prune" (drop oldest ~30%) or "summary" (summarize then replace)
     context_reduce_strategy = (os.environ.get("AISCI_CONTEXT_REDUCE_STRATEGY", "summary") or "summary").strip().lower()
@@ -968,7 +968,7 @@ def main():
                     if _ctx_err.prune_individual:
                         messages = prune_messages_individual(
                             messages,
-                            max_tokens_per_message=llm.config.context_window,
+                            max_tokens_per_message=llm.config.prune_context_window,
                         )
                     messages = prune_messages(messages)
                 else:
@@ -1072,7 +1072,7 @@ def main():
                         if _ctx_err.prune_individual:
                             messages = prune_messages_individual(
                                 original_messages,
-                                max_tokens_per_message=llm.config.context_window,
+                                max_tokens_per_message=llm.config.prune_context_window,
                             )
                             messages = prune_messages(messages)
                         else:
@@ -1084,10 +1084,11 @@ def main():
                         "Context length exceeded — truncating individual messages",
                         step=step,
                         context_window=llm.config.context_window,
+                        prune_context_window=llm.config.prune_context_window,
                     )
                     messages = prune_messages_individual(
                         messages,
-                        max_tokens_per_message=llm.config.context_window,
+                        max_tokens_per_message=llm.config.prune_context_window,
                     )
                 messages = prune_messages(messages)
             # after context reduction (prune or summary), inject reminder and retry unless we already succeeded in summary loop

@@ -43,7 +43,6 @@ from aisci_domain_paper.prompts import (
     render_prioritization_system_prompt,
 )
 from aisci_domain_paper.runtime import (
-    build_reproduce_scaffold_script,
     ensure_submission_repo,
     list_files,
 )
@@ -74,6 +73,7 @@ class EmbeddedPaperEngine:
         submission_dir: Path,
         agent_dir: Path,
         logs_dir: Path,
+        state_dir: Path,
         trace,
     ) -> None:
         self.config = config
@@ -83,15 +83,16 @@ class EmbeddedPaperEngine:
         self.submission_dir = submission_dir
         self.agent_dir = agent_dir
         self.logs_dir = logs_dir
+        self.state_dir = state_dir
         self.trace = trace
         self.analysis_dir = agent_dir / "paper_analysis"
         self.subagent_logs_dir = logs_dir / "subagent_logs"
         self.agent_log_path = logs_dir / "agent.log"
         self.conversation_path = logs_dir / "conversation.jsonl"
-        self.capability_path = agent_dir / "capabilities.json"
+        self.capability_path = state_dir / "capabilities.json"
         self.self_check_path = agent_dir / "final_self_check.md"
         self.self_check_json_path = agent_dir / "final_self_check.json"
-        self.prompt_path = agent_dir / "paper_main_prompt.md"
+        self.prompt_path = state_dir / "paper_main_prompt.md"
         self.state_path = logs_dir / "paper_session_state.json"
         self.prioritized_path = agent_dir / "prioritized_tasks.md"
         self.plan_path = agent_dir / "plan.md"
@@ -119,6 +120,7 @@ class EmbeddedPaperEngine:
 
     def run_main_loop(self) -> str:
         prompt = self.render_main_prompt()
+        self.prompt_path.parent.mkdir(parents=True, exist_ok=True)
         self.prompt_path.write_text(prompt, encoding="utf-8")
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": prompt},
@@ -168,6 +170,9 @@ class EmbeddedPaperEngine:
                         config=self._main_summary_config,
                         task_description=self.config.objective,
                         last_summary=last_summary,
+                        log_path=str(self.logs_dir / "context_summary_requests.jsonl"),
+                        step=step,
+                        actor="main_agent",
                     )
                     if not summarized:
                         messages = self._reduce_messages(messages, exc)
@@ -407,9 +412,14 @@ class EmbeddedPaperEngine:
         phase: str,
         label: str,
         session: SessionInfo | None = None,
+        llm_override: LLMClient | None = None,
     ) -> SubagentOutput:
         current_session = session or self.state_manager.create_session(label)
-        cfg = replace(config, log_dir=str(current_session.directory))
+        cfg = replace(
+            config,
+            log_dir=str(current_session.directory),
+            output_dir=str(self.agent_dir),
+        )
         self.trace.event(
             "subagent_start",
             f"{label} subagent started.",
@@ -417,15 +427,30 @@ class EmbeddedPaperEngine:
             payload={"objective": objective, "session_dir": str(current_session.directory)},
         )
         started = time.time()
-        subagent = cls(self, self.shell, self.llm, cfg, objective=objective, context=context)
-        result: SubagentOutput = subagent.run(context=subagent.build_context())
+        llm = llm_override if llm_override is not None else self.llm
+        subagent = cls(self, self.shell, llm, cfg, objective=objective, context=context)
+        try:
+            result: SubagentOutput = subagent.run(context=subagent.build_context())
+        except Exception as exc:  # noqa: BLE001
+            result = SubagentOutput(
+                status=SubagentStatus.FAILED,
+                content="",
+                error_message=str(exc),
+                runtime_seconds=max(time.time() - started, 0.0),
+                log_path=None,
+            )
         if result.runtime_seconds <= 0:
             result.runtime_seconds = max(time.time() - started, 0.0)
         self.trace.event(
             "subagent_finish",
             f"{label} subagent finished with status={result.status.value}.",
             phase=phase,
-            payload={"log_path": result.log_path, "session_dir": str(current_session.directory)},
+            payload={
+                "status": result.status.value,
+                "log_path": result.log_path,
+                "session_dir": str(current_session.directory),
+                **({"error": result.error_message} if result.error_message else {}),
+            },
         )
         return result
 
@@ -512,36 +537,20 @@ class EmbeddedPaperEngine:
         ).strip()
 
     def subagent_config(self, kind: str, base: SubagentConfig) -> SubagentConfig:
-        return replace(base)
+        return replace(
+            base,
+            log_dir=str(self.subagent_logs_dir),
+            output_dir=str(self.agent_dir),
+        )
 
     def _ensure_workspace(self) -> None:
-        for path in (self.paper_dir, self.submission_dir, self.agent_dir, self.logs_dir, self.analysis_dir, self.subagent_logs_dir):
+        for path in (self.paper_dir, self.submission_dir, self.agent_dir, self.logs_dir):
             path.mkdir(parents=True, exist_ok=True)
         ensure_submission_repo(self.submission_dir)
-        self.prompt_path.write_text(self.render_main_prompt(), encoding="utf-8")
         self.state_manager.ensure_logs()
-        self._ensure_reproduce_script()
-        if not (self.submission_dir / "README.md").exists():
-            (self.submission_dir / "README.md").write_text(
-                "# Paper Reproduction Workspace\n\nManaged by AiScientist paper mode.\n",
-                encoding="utf-8",
-            )
-
-    def _ensure_reproduce_script(self) -> None:
-        if not self.reproduce_path.exists():
-            self.reproduce_path.write_text(
-                build_reproduce_scaffold_script(
-                    self.config.objective,
-                    extra_notes="Replace this scaffold with the paper-specific reproduction workflow.",
-                ),
-                encoding="utf-8",
-            )
-        try:
-            self.reproduce_path.chmod(0o755)
-        except OSError:
-            pass
 
     def _write_capability_report(self) -> None:
+        self.capability_path.parent.mkdir(parents=True, exist_ok=True)
         self.capability_path.write_text(json.dumps(self._capabilities(), indent=2), encoding="utf-8")
 
     def _capabilities(self) -> dict[str, Any]:
@@ -668,7 +677,10 @@ class EmbeddedPaperEngine:
 
     def _reduce_messages(self, messages: list[dict], exc: ContextLengthError) -> list[dict]:
         if exc.prune_individual:
-            messages = prune_messages_individual(messages, max_tokens_per_message=self.llm.config.context_window if self.llm else None)
+            messages = prune_messages_individual(
+                messages,
+                max_tokens_per_message=self.llm.config.prune_context_window if self.llm else None,
+            )
         return prune_messages(messages)
 
     def _default_config_for_kind(self, kind: str) -> SubagentConfig:
@@ -708,6 +720,7 @@ class EmbeddedPaperEngine:
             "impl_exp_sequence": self._impl_exp_sequence,
             "updated_at": time.time(),
         }
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self.state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def _auto_finalize_summary(self) -> str:
@@ -805,7 +818,7 @@ class EmbeddedPaperEngine:
     def _reproduce_script_tracked(self) -> bool:
         if not self._reproduce_script_exists():
             return False
-        result = self.shell.send_command(
+        result = self.shell.send_shell_command(
             "cd /home/submission && git ls-files reproduce.sh | grep -q reproduce.sh && echo TRACKED || echo UNTRACKED",
             timeout=20,
         )
@@ -815,7 +828,7 @@ class EmbeddedPaperEngine:
         warnings: list[str] = []
         if not self._reproduce_script_exists():
             return warnings
-        result = self.shell.send_command(
+        result = self.shell.send_shell_command(
             "cd /home/submission && "
             "bash -n reproduce.sh 2>&1 && echo SYNTAX_OK || echo SYNTAX_ERR; "
             "if [ -f requirements.txt ]; then echo REQS_FOUND; else echo REQS_MISSING; fi",

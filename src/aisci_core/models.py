@@ -57,11 +57,20 @@ class ValidationStrategy(StrEnum):
     IN_SESSION = "in_session"
 
 
+class PullPolicy(StrEnum):
+    IF_MISSING = "if-missing"
+    ALWAYS = "always"
+    NEVER = "never"
+
+
 class RuntimeProfile(BaseModel):
     gpu_count: int = Field(default=0, ge=0)
+    cpu_limit: str | None = None
+    memory_limit: str | None = None
     time_limit: str = "24h"
-    dockerfile_path: str | None = None
-    image_profile: str = "default"
+    image: str | None = None
+    image_profile: str | None = None
+    pull_policy: PullPolicy | None = None
     run_final_validation: bool = False
     network_policy: NetworkPolicy = NetworkPolicy.BRIDGE
     gpu_ids: list[str] = Field(default_factory=list)

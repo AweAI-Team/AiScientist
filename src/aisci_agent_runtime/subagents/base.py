@@ -232,13 +232,9 @@ def _fix_orphaned_tool_calls(messages: list[dict]) -> list[dict]:
 # ====================================================================== #
 
 # Default maximum tiktoken tokens per single message when prune_individual=True.
-# PaperBench uses 190_000 as "buffer under 200k context" (for GPT / tiktoken-aligned
-# models).  For GLM models where tiktoken underestimates by ~1.26×, the correct
-# tiktoken-safe per-message limit is:
-#   GLM-5:  182272 / 1.26 - 5000 ≈ 139660  (= AISCI_CONTEXT_WINDOW)
-#   GLM-4.7:167232 / 1.26 - 5000 ≈ 127700  (= AISCI_CONTEXT_WINDOW)
-# callers should pass max_tokens_per_message = context_window (already tiktoken-corrected)
-# rather than using this global default whenever the model context_window is known.
+# PaperBench uses 190_000 as a rough "buffer under 200k context" for GPT-like
+# tokenizers. When a model config is available, callers should pass the derived
+# prune budget instead of relying on this fallback.
 _MAX_TOKENS_PER_MESSAGE_DEFAULT = 190_000
 
 
@@ -331,9 +327,8 @@ def prune_messages_individual(
     to every message.
 
     ``max_tokens_per_message`` controls the tiktoken-based per-message cap.
-    It should equal ``LLMConfig.context_window`` (already tokenizer-ratio-
-    corrected for GLM) so that a single tool response cannot exceed the
-    model's real input limit even when tiktoken underestimates token counts.
+    It should usually equal ``LLMConfig.prune_context_window`` so that a
+    single tool response cannot exhaust the real input budget for the model.
 
     If not provided, falls back to the GPT-oriented default (190_000) which
     is only accurate for models whose tokenizer ≈ tiktoken.
@@ -502,6 +497,9 @@ class Subagent(ABC):
                         config=self.config.summary_config,
                         task_description=context,
                         last_summary=last_summary,
+                        log_path=os.path.join(self.config.log_dir, "context_summary_requests.jsonl"),
+                        step=step,
+                        actor=self.name,
                     )
                     if not summarized:
                         messages = self._prune_after_context_error(messages, _ctx_err)
@@ -702,10 +700,11 @@ class Subagent(ABC):
                 "context length exceeded — truncating individual messages",
                 name=self.name,
                 context_window=self.llm.config.context_window,
+                prune_context_window=self.llm.config.prune_context_window,
             )
             messages = prune_messages_individual(
                 messages,
-                max_tokens_per_message=self.llm.config.context_window,
+                max_tokens_per_message=self.llm.config.prune_context_window,
             )
             return prune_messages(messages)
         logger.warning("context length exceeded — pruning", name=self.name)

@@ -131,8 +131,15 @@ class LLMResponse:
 
 @dataclass
 class LLMConfig:
-    model: str = "gpt-5.2-2025-12-11"
+    provider: str | None = None
+    model: str = "gpt-5.4"
     max_tokens: int = 32768
+    api_key: str | None = None
+    base_url: str | None = None
+    azure_endpoint: str | None = None
+    api_version: str | None = None
+    organization: str | None = None
+    project: str | None = None
     # temperature=None → not sent to API (PaperBench default: NOT_GIVEN).
     # GLM-5 and reasoning models should leave this as None.
     # Non-reasoning models like glm-4.7 may pass 0.7 explicitly if desired.
@@ -145,25 +152,9 @@ class LLMConfig:
     #   CompletionsLLMClient + GLM/DeepSeek: ignored (they have no equivalent).
     reasoning_effort: str | None = None
     reasoning_summary: str | None = None
-    # context_window: tiktoken-based input token budget used as the prune threshold.
-    #
-    # For GPT models (tokenizer ≈ tiktoken):
-    #   context_window = total_context − max_tokens
-    #   e.g. GPT-5.2: 400000 − 32768 = 367232
-    #   e.g. GPT-5.4: 1000000 − 65536 = 934464
-    #
-    # For GLM models (GLM tokenizer ≈ 1.26× tiktoken):
-    #   context_window = (total_context − max_tokens) / 1.26 − 5000
-    #   e.g. GLM-5:  (202752 − 20480) / 1.26 − 5000 ≈ 139660
-    #   e.g. GLM-4.7:(200000 − 32768) / 1.26 − 5000 ≈ 127700
-    #
-    # The correction ensures that when tiktoken estimates context_window tokens
-    # the actual GLM token count stays below the model's hard limit.
-    # This matches PaperBench regrade_glm scripts (context_window_override=139660).
-    #
-    # Set via AISCI_CONTEXT_WINDOW env var (already tokenizer-corrected).
-    # Also used as max_tokens_per_message for prune_messages_individual() so that
-    # a single oversized tool response is truncated to the same conservative limit.
+    # context_window: maximum model context window from configuration.
+    # The runtime derives a smaller prune budget from this value so there is
+    # room for completion tokens and, for GLM models, tokenizer mismatch.
     context_window: int | None = None
     # use_phase: GPT-5.4+ feature — add "phase" field to replayed assistant
     # messages in Responses API input.  OpenAI strongly recommends this for
@@ -179,6 +170,24 @@ class LLMConfig:
     # this; other models (GPT, Kimi, etc.) must not be affected.
     # Set via AISCI_CLEAR_THINKING env var ("false" | "true").
     clear_thinking: bool | None = None
+
+    @property
+    def prune_context_window(self) -> int | None:
+        if self.context_window is None:
+            return None
+
+        input_budget = int(self.context_window) - int(self.max_tokens)
+        if input_budget <= 0:
+            return max(1, int(self.context_window))
+
+        model_lower = (self.model or "").lower()
+        if "glm" in model_lower:
+            # GLM tokenization is larger than tiktoken by roughly 1.26x in the
+            # workloads we see here, so keep a conservative margin before
+            # falling back to retry-driven pruning.
+            return max(1024, int(input_budget / 1.26 - 5000))
+
+        return input_budget
 
 
 # ====================================================================== #
@@ -495,27 +504,50 @@ class CompletionsLLMClient(LLMClient):
     Used for GLM, DeepSeek, and any model that doesn't support the
     Responses API.  Matches PaperBench's AzureOpenAICompletionsTurnCompleter.
 
-    Client selection:
-    - If AZURE_OPENAI_ENDPOINT is set → ``AzureOpenAI()``
-    - Otherwise                       → ``OpenAI()`` (reads OPENAI_BASE_URL)
+    Client selection is explicit:
+    - ``provider=openai``       → ``OpenAI()``
+    - ``provider=azure-openai`` → ``AzureOpenAI()``
     """
 
     def __init__(self, config: LLMConfig):
         super().__init__(config)
+        provider = (config.provider or os.environ.get("AISCI_PROVIDER") or "").strip().lower()
+        if not provider:
+            raise ValueError("AISCI_PROVIDER is required for the completions client.")
         # No default_headers on client — logid is generated fresh per call
         # in extra_headers, matching PaperBench's AzureOpenAICompletionsTurnCompleter.
-        if os.environ.get("AZURE_OPENAI_ENDPOINT"):
-            self.client = AzureOpenAI(max_retries=0)
+        if provider == "azure-openai":
+            client_kwargs: dict[str, Any] = {"max_retries": 0}
+            if config.api_key:
+                client_kwargs["api_key"] = config.api_key
+            if config.azure_endpoint:
+                client_kwargs["azure_endpoint"] = config.azure_endpoint
+            if config.api_version:
+                client_kwargs["api_version"] = config.api_version
+            if config.base_url:
+                client_kwargs["base_url"] = config.base_url
+            self.client = AzureOpenAI(**client_kwargs)
             logger.info(
                 "CompletionsLLMClient: using AzureOpenAI",
-                endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT", "")[:60],
+                endpoint=(config.azure_endpoint or os.environ.get("AZURE_OPENAI_ENDPOINT", ""))[:60],
             )
-        else:
-            self.client = OpenAI(max_retries=0)
+        elif provider == "openai":
+            client_kwargs = {"max_retries": 0}
+            if config.api_key:
+                client_kwargs["api_key"] = config.api_key
+            if config.base_url:
+                client_kwargs["base_url"] = config.base_url
+            if config.organization:
+                client_kwargs["organization"] = config.organization
+            if config.project:
+                client_kwargs["project"] = config.project
+            self.client = OpenAI(**client_kwargs)
             logger.info(
                 "CompletionsLLMClient: using OpenAI",
-                base_url=os.environ.get("OPENAI_BASE_URL", "")[:60],
+                base_url=(config.base_url or os.environ.get("OPENAI_BASE_URL", ""))[:60],
             )
+        else:
+            raise ValueError(f"Unsupported LLM provider for completions client: {provider}")
 
     def chat(
         self,
@@ -662,27 +694,50 @@ class ResponsesLLMClient(LLMClient):
     - Chat Completions tool schemas → Responses API tool format
     - Responses API output → common ``LLMResponse``
 
-    Client selection:
-    - If AZURE_OPENAI_ENDPOINT is set → ``AzureOpenAI()``
-    - Otherwise                       → ``OpenAI()``
+    Client selection is explicit:
+    - ``provider=openai``       → ``OpenAI()``
+    - ``provider=azure-openai`` → ``AzureOpenAI()``
     """
 
     def __init__(self, config: LLMConfig):
         super().__init__(config)
+        provider = (config.provider or os.environ.get("AISCI_PROVIDER") or "").strip().lower()
+        if not provider:
+            raise ValueError("AISCI_PROVIDER is required for the responses client.")
         # No default_headers on client — logid is generated fresh per call
         # in extra_headers, matching PaperBench's AzureOpenAIResponsesTurnCompleter.
-        if os.environ.get("AZURE_OPENAI_ENDPOINT"):
-            self.client = AzureOpenAI(max_retries=0)
+        if provider == "azure-openai":
+            client_kwargs: dict[str, Any] = {"max_retries": 0}
+            if config.api_key:
+                client_kwargs["api_key"] = config.api_key
+            if config.azure_endpoint:
+                client_kwargs["azure_endpoint"] = config.azure_endpoint
+            if config.api_version:
+                client_kwargs["api_version"] = config.api_version
+            if config.base_url:
+                client_kwargs["base_url"] = config.base_url
+            self.client = AzureOpenAI(**client_kwargs)
             logger.info(
                 "ResponsesLLMClient: using AzureOpenAI",
-                endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT", "")[:60],
+                endpoint=(config.azure_endpoint or os.environ.get("AZURE_OPENAI_ENDPOINT", ""))[:60],
             )
-        else:
-            self.client = OpenAI(max_retries=0)
+        elif provider == "openai":
+            client_kwargs = {"max_retries": 0}
+            if config.api_key:
+                client_kwargs["api_key"] = config.api_key
+            if config.base_url:
+                client_kwargs["base_url"] = config.base_url
+            if config.organization:
+                client_kwargs["organization"] = config.organization
+            if config.project:
+                client_kwargs["project"] = config.project
+            self.client = OpenAI(**client_kwargs)
             logger.info(
                 "ResponsesLLMClient: using OpenAI",
-                base_url=os.environ.get("OPENAI_BASE_URL", "")[:60],
+                base_url=(config.base_url or os.environ.get("OPENAI_BASE_URL", ""))[:60],
             )
+        else:
+            raise ValueError(f"Unsupported LLM provider for responses client: {provider}")
 
     def chat(
         self,
@@ -898,60 +953,64 @@ def create_llm_client(config: LLMConfig | None = None) -> LLMClient:
     """
     Create the appropriate LLM client based on configuration.
 
-    If ``config`` is None, reads all settings from environment variables:
-    - AISCI_MODEL             → model name   (default: gpt-5.2-2025-12-11)
-    - AISCI_API_MODE          → completions | responses  (default: completions)
-    - AISCI_WEB_SEARCH        → true | false (default: false, responses only)
+    If ``config`` is None, reads all settings from environment variables.
+    In normal ``aisci`` runs these env vars are materialized from the
+    host-side YAML registry before the runtime process starts:
+    - AISCI_PROVIDER          → openai | azure-openai
+    - AISCI_MODEL             → model name
+    - AISCI_API_MODE          → completions | responses
+    - AISCI_WEB_SEARCH        → true | false (responses only)
     - AISCI_REASONING_EFFORT  → high | medium | low | xhigh
                                 (responses: native param; completions+Gemini: extra_body)
     - AISCI_REASONING_SUMMARY → auto | none (responses only)
-    - AISCI_USE_PHASE         → true | false (default: false, responses only)
+    - AISCI_USE_PHASE         → true | false (responses only)
                                 GPT-5.4+: add phase="commentary" to replayed
                                 assistant messages to prevent early stopping.
-    - AISCI_MAX_TOKENS        → max output tokens (default: 32768)
-                                Set to 65536 for GPT-5.4 / Gemini, 20480 for GLM-5.
-    - AISCI_CONTEXT_WINDOW    → tiktoken-based prune threshold (default: model default).
-                                Must already be tokenizer-corrected for GLM models:
-                                  GLM-5:   139660  (= (202752-20480)/1.26 - 5000)
-                                  GLM-4.7: 127700  (= (200000-32768)/1.26 - 5000)
-                                  GPT-5.2: 367232  (= 400000 - 32768, no correction)
-                                  GPT-5.4: 934464  (= 1000000 - 65536, no correction)
-                                  Gemini:  934464  (= 1000000 - 65536, ratio ~1.0 assumed)
-                                Also used as max_tokens_per_message in prune_messages_individual().
-    - AISCI_TEMPERATURE       → float temperature, e.g. "0.7" (default: not sent,
-                                mirrors PaperBench's NOT_GIVEN).  GLM-5 / reasoning
-                                models should leave this unset.
+    - AISCI_MAX_TOKENS        → max output tokens
+    - AISCI_CONTEXT_WINDOW    → maximum model context window from the profile.
+                                The runtime derives the actual prune budget locally:
+                                  GLM-5:   202752 -> 103901
+                                  GPT-5.4: 1000000 -> 868928
+    - AISCI_TEMPERATURE       → float temperature, e.g. "0.7"
     - AISCI_CLEAR_THINKING    → "false" | "true" (Completions only, GLM-5). When set,
                                 extra_body.thinking.clear_thinking is sent. "true"
-                                = clear each turn (recommended); "false" = Preserved
-                                Thinking. If unset and model is glm-5, default is True.
-
-    Client selection (both modes):
-    - AZURE_OPENAI_ENDPOINT set → AzureOpenAI()
-    - OPENAI_BASE_URL set       → OpenAI(base_url=...)
+                                = clear each turn; "false" = Preserved Thinking.
     """
     if config is None:
         _max_tokens_env = os.environ.get("AISCI_MAX_TOKENS")
         _ctx_window_env = os.environ.get("AISCI_CONTEXT_WINDOW")
         _temperature_env = os.environ.get("AISCI_TEMPERATURE")
         _clear_thinking_env = os.environ.get("AISCI_CLEAR_THINKING", "").strip().lower()
-        _model = os.environ.get("AISCI_MODEL", "gpt-5.2-2025-12-11")
+        _provider = (os.environ.get("AISCI_PROVIDER") or "").strip() or None
+        _model = (os.environ.get("AISCI_MODEL") or "").strip()
+        _api_mode = (os.environ.get("AISCI_API_MODE") or "").strip().lower()
+        if _provider is None:
+            raise ValueError("AISCI_PROVIDER is required to create an LLM client.")
+        if not _model:
+            raise ValueError("AISCI_MODEL is required to create an LLM client.")
+        if _api_mode not in {"responses", "completions"}:
+            raise ValueError("AISCI_API_MODE must be 'responses' or 'completions'.")
+        if not _max_tokens_env:
+            raise ValueError("AISCI_MAX_TOKENS is required to create an LLM client.")
         clear_thinking: bool | None = None
         if _clear_thinking_env == "false":
             clear_thinking = False
         elif _clear_thinking_env == "true":
             clear_thinking = True
-        elif _clear_thinking_env == "" and "glm-5" in _model.lower():
-            # GLM-5: default to clear each turn (True) for stable agent performance;
-            # Preserved Thinking (False) often grows context too fast and hurts scores.
-            clear_thinking = True
         config = LLMConfig(
-            model=os.environ.get("AISCI_MODEL", "gpt-5.2-2025-12-11"),
-            api_mode=os.environ.get("AISCI_API_MODE", "completions"),
+            provider=_provider,
+            model=_model,
+            api_mode=_api_mode,
+            api_key=os.environ.get("OPENAI_API_KEY") or os.environ.get("AZURE_OPENAI_API_KEY") or None,
+            base_url=os.environ.get("OPENAI_BASE_URL") or None,
+            azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT") or None,
+            api_version=os.environ.get("OPENAI_API_VERSION") or None,
+            organization=os.environ.get("OPENAI_ORG_ID") or None,
+            project=os.environ.get("OPENAI_PROJECT") or None,
             web_search=os.environ.get("AISCI_WEB_SEARCH", "").lower() == "true",
             reasoning_effort=os.environ.get("AISCI_REASONING_EFFORT") or None,
             reasoning_summary=os.environ.get("AISCI_REASONING_SUMMARY") or None,
-            max_tokens=int(_max_tokens_env) if _max_tokens_env else 32768,
+            max_tokens=int(_max_tokens_env),
             context_window=int(_ctx_window_env) if _ctx_window_env else None,
             temperature=float(_temperature_env) if _temperature_env else None,
             use_phase=os.environ.get("AISCI_USE_PHASE", "").lower() == "true",
@@ -961,9 +1020,11 @@ def create_llm_client(config: LLMConfig | None = None) -> LLMClient:
     if config.api_mode == "responses":
         logger.info(
             "Creating Responses API client",
+            provider=config.provider,
             model=config.model,
             max_tokens=config.max_tokens,
             context_window=config.context_window,
+            prune_context_window=config.prune_context_window,
             web_search=config.web_search,
             reasoning_effort=config.reasoning_effort,
             reasoning_summary=config.reasoning_summary,
@@ -973,9 +1034,11 @@ def create_llm_client(config: LLMConfig | None = None) -> LLMClient:
     else:
         logger.info(
             "Creating Chat Completions API client",
+            provider=config.provider,
             model=config.model,
             max_tokens=config.max_tokens,
             context_window=config.context_window,
+            prune_context_window=config.prune_context_window,
             clear_thinking=config.clear_thinking,
         )
         return CompletionsLLMClient(config)

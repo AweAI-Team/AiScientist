@@ -1,4 +1,7 @@
 .venv/
+.env
+.env.aisci
+.env.local
 .pytest_cache/
 .aisci/
 jobs/

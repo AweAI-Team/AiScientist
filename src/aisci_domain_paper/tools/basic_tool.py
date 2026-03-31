@@ -138,7 +138,7 @@ class PaperGitCommitTool(Tool):
         return "git_commit"
 
     def execute(self, shell, message: str, **kwargs: Any) -> str:
-        shell.send_command("cd /home/submission && git init 2>/dev/null || true", timeout=10)
+        shell.send_shell_command("cd /home/submission && git init 2>/dev/null || true", timeout=10)
         gitignore_path = "/home/submission/.gitignore"
         if not shell.file_exists(gitignore_path):
             shell.write_file(
@@ -159,7 +159,7 @@ class PaperGitCommitTool(Tool):
                 ),
             )
         shell.write_file("/tmp/_paper_commit_msg.txt", message)
-        result = shell.send_command(
+        result = shell.send_shell_command(
             "cd /home/submission && "
             "git config user.email 'aiscientist@local' && "
             "git config user.name 'AiScientist' && "

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -23,7 +24,7 @@ def _paper_job_record(*, status: JobStatus, phase: RunPhase, error: str | None =
         status=status,
         phase=phase,
         objective="paper cli",
-        llm_profile="gpt-5.4-responses",
+        llm_profile="paper-default",
         runtime_profile=RuntimeProfile(
             workspace_layout=WorkspaceLayout.PAPER,
             run_final_validation=True,
@@ -44,7 +45,7 @@ def _create_paper_job(tmp_path: Path):
         JobSpec(
             job_type=JobType.PAPER,
             objective="paper console",
-            llm_profile="gpt-5.4-responses",
+            llm_profile="paper-default",
             runtime_profile=RuntimeProfile(
                 workspace_layout=WorkspaceLayout.PAPER,
                 run_final_validation=True,
@@ -68,14 +69,22 @@ def _create_paper_job(tmp_path: Path):
     (paths.workspace_dir / "agent" / "plan.md").write_text("# plan\n", encoding="utf-8")
     (paths.workspace_dir / "agent" / "impl_log.md").write_text("# impl\n", encoding="utf-8")
     (paths.workspace_dir / "agent" / "exp_log.md").write_text("# exp\n", encoding="utf-8")
-    (paths.workspace_dir / "agent" / "paper_main_prompt.md").write_text("# prompt\n", encoding="utf-8")
-    (paths.workspace_dir / "agent" / "capabilities.json").write_text(
+    (paths.state_dir / "resolved_llm_config.json").write_text(
+        json.dumps({"profile": "paper-default", "backend": "openai"}),
+        encoding="utf-8",
+    )
+    (paths.state_dir / "paper_main_prompt.md").write_text("# prompt\n", encoding="utf-8")
+    (paths.state_dir / "capabilities.json").write_text(
         json.dumps(
             {
                 "online_research": {"available": True},
                 "linter": {"available": True},
             }
         ),
+        encoding="utf-8",
+    )
+    (paths.state_dir / "sandbox_session.json").write_text(
+        json.dumps({"container_name": "paper-test-session"}),
         encoding="utf-8",
     )
     (paths.workspace_dir / "submission" / "reproduce.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
@@ -89,8 +98,10 @@ def test_paper_job_summary_exposes_product_signals(tmp_path: Path, monkeypatch) 
     assert summary["paper_capabilities"]["online_research"] == "available"
     assert summary["paper_capabilities"]["final_self_check"] == "enabled"
     assert any(item["label"] == "main job log" for item in summary["paper_log_targets"])
+    assert any(item["label"] == "sandbox session" for item in summary["paper_log_targets"])
     assert any(item["label"].startswith("session: ") for item in summary["paper_log_targets"])
     assert any(item["label"] == "paper summary" for item in summary["paper_artifacts"])
+    assert any(item["label"] == "resolved llm config" for item in summary["paper_artifacts"])
     assert any(item["label"] == "main prompt snapshot" for item in summary["paper_artifacts"])
 
 
@@ -108,6 +119,30 @@ def test_paper_doctor_reports_console_tip() -> None:
     report = paper_doctor_report()
     assert any(check.name == "paper console" for check in report)
     assert any(check.name == "online_research" for check in report)
+
+
+def test_cli_global_env_file_option_loads_api_key(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    env_file = tmp_path / "paper.env"
+    env_file.write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("AISCI_PAPER_DOCTOR_PROFILE", "gpt-5.4")
+
+    result = runner.invoke(app, ["--env-file", str(env_file), "paper", "doctor"])
+
+    assert result.exit_code == 0
+    assert "- api_key: ok (Backend credentials detected)" in result.stdout
+
+
+def test_cli_global_output_root_option_sets_env(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+    monkeypatch.delenv("AISCI_OUTPUT_ROOT", raising=False)
+    monkeypatch.setattr("aisci_app.cli.paper_doctor_report", lambda: [])
+
+    result = runner.invoke(app, ["--output-root", str(tmp_path / "runtime"), "paper", "doctor"])
+
+    assert result.exit_code == 0
+    assert os.environ["AISCI_OUTPUT_ROOT"] == str((tmp_path / "runtime").resolve())
 
 
 def test_worker_main_returns_nonzero_when_job_fails(monkeypatch) -> None:
@@ -153,3 +188,46 @@ def test_paper_run_wait_reports_final_failure(monkeypatch, tmp_path: Path) -> No
     assert payload["status"] == "failed"
     assert payload["phase"] == "analyze"
     assert payload["error"] == "docker missing"
+
+
+def test_paper_run_accepts_gpu_ids(monkeypatch, tmp_path: Path) -> None:
+    runner = CliRunner()
+    captured: dict[str, object] = {}
+
+    class _Service:
+        def __init__(self) -> None:
+            self.store = None
+
+        def create_job(self, spec) -> JobRecord:  # noqa: ANN001
+            return _paper_job_record(status=JobStatus.PENDING, phase=RunPhase.INGEST)
+
+        def spawn_worker(self, job_id: str, wait: bool = False) -> int:  # noqa: ARG002
+            return 0
+
+    def fake_build_paper_job_spec(**kwargs):  # noqa: ANN001
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("aisci_app.cli.JobService", _Service)
+    monkeypatch.setattr("aisci_app.cli.build_paper_job_spec", fake_build_paper_job_spec)
+
+    result = runner.invoke(
+        app,
+        ["paper", "run", "--pdf", str(tmp_path / "paper.pdf"), "--gpu-ids", "4,5"],
+    )
+
+    assert result.exit_code == 0
+    assert captured["gpus"] == 0
+    assert captured["gpu_ids"] == ["4", "5"]
+
+
+def test_paper_run_rejects_gpu_count_and_ids_together(tmp_path: Path) -> None:
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        ["paper", "run", "--pdf", str(tmp_path / "paper.pdf"), "--gpus", "2", "--gpu-ids", "4,5"],
+    )
+
+    assert result.exit_code != 0
+    assert "Use either --gpus <count> or --gpu-ids <id,id>, not both." in (result.stdout + result.stderr)

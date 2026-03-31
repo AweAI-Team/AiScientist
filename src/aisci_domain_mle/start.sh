@@ -25,7 +25,7 @@ python -c "import torch; print('GPU:', torch.cuda.get_device_name(0) if torch.cu
 echo "========================================="
 echo "  AI Scientist Agent for MLE-Bench"
 echo "========================================="
-echo "Model:       ${AISCI_MODEL:-gpt-5.2-2025-12-11}"
+echo "Model:       ${AISCI_MODEL:-gpt-5.4}"
 echo "API mode:    ${AISCI_API_MODE:-completions}"
 echo "Web search:  ${AISCI_WEB_SEARCH:-false}"
 echo "Reasoning:   ${AISCI_REASONING_EFFORT:-none} (summary: ${AISCI_REASONING_SUMMARY:-none})"

@@ -265,28 +265,15 @@ class PaperReaderCoordinator:
         label: str,
         llm=None,
     ) -> SubagentOutput:
-        subagent = subagent_cls(
-            self.engine,
-            self.engine.shell,
-            llm if llm is not None else self.engine.llm,
-            config,
+        return self.engine.run_subagent_output(
+            subagent_cls,
             objective=objective,
             context=context,
-        )
-        self.engine.trace.event(
-            "subagent_start",
-            f"{label} subagent started.",
+            config=config,
             phase=phase,
-            payload={"objective": objective},
+            label=label,
+            llm_override=llm if llm is not None else self.engine.llm,
         )
-        output = subagent.run(context=subagent.build_context())
-        self.engine.trace.event(
-            "subagent_finish",
-            f"{label} subagent finished with status={output.status.value}.",
-            phase=phase,
-            payload={"status": output.status.value, "log_path": output.log_path},
-        )
-        return output
 
     def _clone_llm(self):
         llm = self.engine.llm

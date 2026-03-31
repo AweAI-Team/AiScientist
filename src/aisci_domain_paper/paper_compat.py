@@ -129,7 +129,7 @@ class MappedShellInterface:
         self.mapper = mapper
         self.working_dir = str(self.mapper.real_path(working_dir))
 
-    def send_command(self, cmd: str, timeout: int = 300) -> "ShellResult":
+    def send_shell_command(self, cmd: str, timeout: int = 300) -> "ShellResult":
         refusal = _refuse_broad_python_kill(cmd)
         if refusal is not None:
             return ShellResult(output=refusal, exit_code=1)
@@ -147,6 +147,9 @@ class MappedShellInterface:
             return ShellResult(output=f"ERROR: command timed out after {timeout}s", exit_code=137)
         output = (completed.stdout or "") + (completed.stderr or "")
         return ShellResult(output=output.strip(), exit_code=completed.returncode)
+
+    def send_command(self, cmd: str, timeout: int = 300) -> "ShellResult":
+        return self.send_shell_command(cmd, timeout=timeout)
 
     def read_file(self, path: str | os.PathLike[str]) -> str:
         return self.mapper.real_path(path).read_text(encoding="utf-8", errors="replace")

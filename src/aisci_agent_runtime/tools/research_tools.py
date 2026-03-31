@@ -249,7 +249,7 @@ class LinterTool(Tool):
         **kwargs: Any,  # noqa: ARG002
     ) -> str:
         lint_command = command.strip() or f"python -m compileall {path}"
-        result = shell.send_command(lint_command, timeout=timeout)
+        result = shell.send_shell_command(lint_command, timeout=timeout)
         return result.output.strip() or f"exit_code={result.exit_code}"
 
     def get_tool_schema(self) -> dict[str, Any]:

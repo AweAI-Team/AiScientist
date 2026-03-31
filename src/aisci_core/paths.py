@@ -6,12 +6,21 @@ from pathlib import Path
 from aisci_core.models import JobPaths
 
 
+def _resolve_env_path(name: str, default: Path | None = None) -> Path:
+    value = os.environ.get(name)
+    if value:
+        return Path(value).expanduser().resolve()
+    if default is not None:
+        return default.resolve()
+    return Path.cwd().resolve()
+
+
 def repo_root() -> Path:
-    return Path(os.environ.get("AISCI_REPO_ROOT", Path.cwd())).resolve()
+    return _resolve_env_path("AISCI_REPO_ROOT", Path.cwd())
 
 
 def var_root() -> Path:
-    return repo_root()
+    return _resolve_env_path("AISCI_OUTPUT_ROOT", repo_root())
 
 
 def jobs_root() -> Path:
@@ -53,4 +62,3 @@ def ensure_job_dirs(job_paths: JobPaths) -> JobPaths:
     ):
         path.mkdir(parents=True, exist_ok=True)
     return job_paths
-

@@ -14,6 +14,7 @@ from aisci_domain_paper.configs import (
     DEFAULT_PAPER_SYNTHESIS_CONFIG,
     DEFAULT_PRIORITIZATION_CONFIG,
 )
+from aisci_domain_paper.engine import EmbeddedPaperEngine, PaperRuntimeConfig
 from aisci_domain_paper.subagents import subagent_class_for_kind
 from aisci_domain_paper.subagents.coordinator import SubagentCoordinator, SubagentTask
 from aisci_domain_paper.subagents.paper_reader import PaperReaderCoordinator
@@ -37,6 +38,9 @@ from aisci_domain_paper.tools.implementation_tool import ImplementationTool
 from aisci_domain_paper.tools.paper_reader_tool import ReadPaperTool
 from aisci_domain_paper.tools.prioritization_tool import PrioritizeTasksTool
 from aisci_domain_paper.tools.spawn_subagent_tool import build_main_tools, build_spawn_subagent_tool
+from aisci_runtime_docker.models import ContainerSession, DockerProfile, SessionMount
+from aisci_runtime_docker.shell_interface import DockerShellInterface
+from aisci_agent_runtime.tools.shell_tools import ReadFileChunkTool, SearchFileTool
 
 
 class _StubEngine:
@@ -195,6 +199,29 @@ def test_clean_validation_report_is_detailed_for_main_agent(tmp_path: Path) -> N
     assert "implement(mode=\"fix\"" in report
 
 
+def test_docker_shell_interface_exposes_host_mapping_for_mounted_paths(tmp_path: Path) -> None:
+    summary_path = tmp_path / "agent" / "paper_analysis" / "summary.md"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text("# Summary\n", encoding="utf-8")
+    shell = DockerShellInterface(
+        runtime=SimpleNamespace(),
+        session=ContainerSession(
+            container_name="paper-test",
+            image_tag="aisci-paper:latest",
+            profile=DockerProfile(name="paper", image="aisci-paper:latest"),
+            runtime_profile=SimpleNamespace(),
+            workspace_layout="paper",
+            mounts=(SessionMount(source=tmp_path, target="/home"),),
+            workdir="/home/submission",
+        ),
+    )
+
+    assert shell.file_exists("/home/agent/paper_analysis/summary.md") is True
+    assert shell.read_file("/home/agent/paper_analysis/summary.md") == "# Summary\n"
+    assert shell.download("/home/agent/paper_analysis/summary.md") == b"# Summary\n"
+    assert shell._mounted_host_path("/home/a/new_dir") == tmp_path / "a" / "new_dir"
+
+
 def test_state_manager_tracks_session_boundaries_and_recent_history(tmp_path: Path) -> None:
     state = PaperStateManager(
         agent_dir=tmp_path / "agent",
@@ -202,12 +229,118 @@ def test_state_manager_tracks_session_boundaries_and_recent_history(tmp_path: Pa
         subagent_logs_dir=tmp_path / "logs" / "subagent_logs",
     )
     state.ensure_logs()
+    assert not state.impl_log_path.exists()
+    assert not state.exp_log_path.exists()
+    assert not state.subagent_logs_dir.exists()
     session = state.create_session("implementation")
     state.append_separator(session)
     state.append_session_note("implementation", "Implemented core loop", "Changed reproduce.sh and training entrypoint.")
     recent = state.recent_impl_history()
     assert "Implement Session 1" in recent
     assert "Implemented core loop" in recent
+
+
+def test_engine_workspace_bootstrap_uses_lazy_file_creation(tmp_path: Path) -> None:
+    engine = EmbeddedPaperEngine(
+        config=PaperRuntimeConfig(
+            job_id="paper-job",
+            objective="reproduce paper",
+            llm_profile_name="paper-default",
+        ),
+        shell=object(),
+        llm=None,
+        paper_dir=tmp_path / "paper",
+        submission_dir=tmp_path / "submission",
+        agent_dir=tmp_path / "agent",
+        logs_dir=tmp_path / "logs",
+        state_dir=tmp_path / "state",
+        trace=_TraceRecorder(),
+    )
+
+    engine._ensure_workspace()
+
+    assert engine.paper_dir.exists()
+    assert engine.submission_dir.exists()
+    assert engine.agent_dir.exists()
+    assert engine.logs_dir.exists()
+    assert (engine.submission_dir / ".gitignore").exists()
+    assert (engine.submission_dir / ".git").exists()
+    assert not engine.analysis_dir.exists()
+    assert not engine.subagent_logs_dir.exists()
+    assert not engine.reproduce_path.exists()
+    assert not engine.state_manager.impl_log_path.exists()
+    assert not engine.state_manager.exp_log_path.exists()
+    assert not engine.prompt_path.exists()
+    assert not engine.capability_path.exists()
+    assert not (engine.submission_dir / "README.md").exists()
+
+
+def test_engine_subagent_config_uses_host_paths(tmp_path: Path) -> None:
+    engine = EmbeddedPaperEngine(
+        config=PaperRuntimeConfig(
+            job_id="paper-job",
+            objective="reproduce paper",
+            llm_profile_name="paper-default",
+        ),
+        shell=object(),
+        llm=None,
+        paper_dir=tmp_path / "paper",
+        submission_dir=tmp_path / "submission",
+        agent_dir=tmp_path / "agent",
+        logs_dir=tmp_path / "logs",
+        state_dir=tmp_path / "state",
+        trace=_TraceRecorder(),
+    )
+
+    cfg = engine.subagent_config("paper_reader", DEFAULT_PAPER_READER_CONFIG)
+
+    assert cfg.log_dir == str(tmp_path / "logs" / "subagent_logs")
+    assert cfg.output_dir == str(tmp_path / "agent")
+
+
+def test_run_subagent_output_converts_exceptions_to_failed_result(tmp_path: Path) -> None:
+    engine = EmbeddedPaperEngine(
+        config=PaperRuntimeConfig(
+            job_id="paper-job",
+            objective="reproduce paper",
+            llm_profile_name="paper-default",
+        ),
+        shell=object(),
+        llm=object(),
+        paper_dir=tmp_path / "paper",
+        submission_dir=tmp_path / "submission",
+        agent_dir=tmp_path / "agent",
+        logs_dir=tmp_path / "logs",
+        state_dir=tmp_path / "state",
+        trace=_TraceRecorder(),
+    )
+    engine._ensure_workspace()
+
+    class BrokenSubagent:
+        def __init__(self, *args, **kwargs) -> None:  # noqa: D401, ANN003
+            self.config = args[3]
+
+        def build_context(self) -> str:
+            return "context"
+
+        def run(self, context: str = "") -> SubagentOutput:  # noqa: ARG002
+            raise PermissionError("simulated host path failure")
+
+    result = engine.run_subagent_output(
+        BrokenSubagent,
+        objective="broken",
+        context="",
+        config=DEFAULT_PAPER_READER_CONFIG,
+        phase="analyze",
+        label="broken_reader",
+    )
+
+    assert result.status == SubagentStatus.FAILED
+    assert result.error_message == "simulated host path failure"
+    assert any(
+        name == "subagent_finish" and payload and payload.get("error") == "simulated host path failure"
+        for name, _message, _phase, payload in engine.trace.events
+    )
 
 
 def test_reader_coordinator_returns_navigation_summary(tmp_path: Path, monkeypatch) -> None:
@@ -315,20 +448,23 @@ def test_prioritization_runner_builds_structured_task_description(tmp_path: Path
             self.prioritized_path.parent.mkdir(parents=True, exist_ok=True)
             self.plan_path.parent.mkdir(parents=True, exist_ok=True)
             class Shell:
-                def mapped(self_inner, path: str) -> Path:
+                def file_exists(self_inner, path: str) -> bool:
                     mapping = {
-                        "/home/agent/paper_analysis": self.analysis_dir,
+                        "/home/agent/paper_analysis/summary.md": self.analysis_dir / "summary.md",
                         "/home/paper/rubric.json": self.paper_dir / "rubric.json",
                         "/home/paper/addendum.md": self.paper_dir / "addendum.md",
                         "/home/paper/blacklist.txt": self.paper_dir / "blacklist.txt",
                     }
-                    return mapping.get(path, Path(path))
-
-                def file_exists(self_inner, path: str) -> bool:
-                    return self_inner.mapped(path).exists()
+                    return mapping.get(path, Path(path)).exists()
 
                 def read_file(self_inner, path: str) -> str:
-                    return self_inner.mapped(path).read_text(encoding="utf-8")
+                    mapping = {
+                        "/home/agent/paper_analysis/summary.md": self.analysis_dir / "summary.md",
+                        "/home/paper/rubric.json": self.paper_dir / "rubric.json",
+                        "/home/paper/addendum.md": self.paper_dir / "addendum.md",
+                        "/home/paper/blacklist.txt": self.paper_dir / "blacklist.txt",
+                    }
+                    return mapping.get(path, Path(path)).read_text(encoding="utf-8")
 
             self.shell = Shell()
             self.llm = object()
@@ -357,6 +493,30 @@ def test_prioritization_runner_builds_structured_task_description(tmp_path: Path
         def subagent_config(self, kind: str, base):  # noqa: ARG002
             return base
 
+        def run_subagent_output(
+            self,
+            cls,  # noqa: ARG002
+            *,
+            objective: str,  # noqa: ARG002
+            context: str,  # noqa: ARG002
+            config,  # noqa: ARG002
+            phase: str,  # noqa: ARG002
+            label: str,  # noqa: ARG002
+            session=None,  # noqa: ARG002
+            llm_override=None,  # noqa: ARG002
+        ) -> SubagentOutput:
+            self.prioritized_path.write_text(
+                "# Prioritized Implementation Plan\n\n## Executive Summary\n- P0: core method.\n",
+                encoding="utf-8",
+            )
+            return SubagentOutput(
+                status=SubagentStatus.COMPLETED,
+                content="# Prioritized Implementation Plan\n\n## Executive Summary\n- P0: core method.\n",
+                num_steps=6,
+                runtime_seconds=2.0,
+                log_path=str(tmp_path / "logs" / "subagent_logs" / "prioritization.jsonl"),
+            )
+
         def _capabilities(self) -> dict[str, dict[str, bool]]:
             return {
                 "online_research": {"available": True},
@@ -366,21 +526,6 @@ def test_prioritization_runner_builds_structured_task_description(tmp_path: Path
             return {"blacklist": []}
 
     engine = Engine()
-
-    def fake_run(self, context: str = ""):  # noqa: ANN001
-        engine.prioritized_path.write_text(
-            "# Prioritized Implementation Plan\n\n## Executive Summary\n- P0: core method.\n",
-            encoding="utf-8",
-        )
-        return SubagentOutput(
-            status=SubagentStatus.COMPLETED,
-            content="# Prioritized Implementation Plan\n\n## Executive Summary\n- P0: core method.\n",
-            num_steps=6,
-            runtime_seconds=2.0,
-            log_path="/tmp/prioritization.jsonl",
-        )
-
-    monkeypatch.setattr(PaperPrioritizationSubagent, "run", fake_run, raising=False)
 
     result = PrioritizationRunner(engine).run()
 
@@ -431,3 +576,23 @@ def test_link_summary_blocks_blacklisted_url() -> None:
         constraints={"blocked_search_patterns": build_blocked_patterns_from_blacklist(["blocked.example"])},
     )
     assert "ACCESS DENIED" in result
+
+
+def test_read_file_chunk_missing_file_is_nonfatal() -> None:
+    class Shell:
+        def file_exists(self, path: str) -> bool:  # noqa: ARG002
+            return False
+
+    result = ReadFileChunkTool().execute(Shell(), "/home/paper/addendum.md")
+
+    assert result == "File not found: /home/paper/addendum.md. It may be optional or not staged for this run."
+
+
+def test_search_file_missing_path_is_nonfatal() -> None:
+    class Shell:
+        def file_exists(self, path: str) -> bool:  # noqa: ARG002
+            return False
+
+    result = SearchFileTool().execute(Shell(), pattern="PINN", path="/home/paper/addendum.md")
+
+    assert result == "File not found: /home/paper/addendum.md. It may be optional or not staged for this run."

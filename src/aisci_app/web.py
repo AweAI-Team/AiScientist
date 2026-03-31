@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from aisci_agent_runtime.llm_profiles import default_llm_profile_name
 from aisci_app.presentation import (
     build_job_spec_clone,
     build_mle_job_spec,
@@ -21,7 +22,8 @@ from aisci_app.presentation import (
     read_text_preview,
 )
 from aisci_app.service import JobService
-from aisci_core.models import JobRecord, JobSpec, JobType, MLESpec, NetworkPolicy, PaperSpec, RuntimeProfile, WorkspaceLayout
+from aisci_core.env_config import load_runtime_env
+from aisci_core.models import JobRecord, JobSpec, JobType, MLESpec, NetworkPolicy, PaperSpec, PullPolicy, RuntimeProfile, WorkspaceLayout
 from aisci_core.paths import ensure_job_dirs, repo_root, resolve_job_paths
 from aisci_core.store import JobStore
 
@@ -66,8 +68,10 @@ def _pick_default_preview(job_id: str) -> tuple[Path | None, str | None]:
     candidates = [
         paths.logs_dir / "job.log",
         paths.logs_dir / "worker.log",
+        paths.state_dir / "resolved_llm_config.json",
         paths.artifacts_dir / "validation_report.json",
         paths.logs_dir / "paper_session_state.json",
+        paths.state_dir / "sandbox_session.json",
         paths.workspace_dir / "agent" / "paper_analysis" / "summary.md",
         paths.workspace_dir / "agent" / "prioritized_tasks.md",
         paths.workspace_dir / "agent" / "impl_log.md",
@@ -104,7 +108,8 @@ def _build_paper_form_spec(form: dict[str, Any]) -> JobSpec:
     runtime = RuntimeProfile(
         gpu_count=form["gpus"],
         time_limit=form["time_limit"],
-        dockerfile_path=form["dockerfile_path"],
+        image=form["image"],
+        pull_policy=PullPolicy(form["pull_policy"]) if form.get("pull_policy") else None,
         run_final_validation=form["run_final_validation"],
         network_policy=NetworkPolicy.BRIDGE,
         workspace_layout=WorkspaceLayout.PAPER,
@@ -133,7 +138,8 @@ def _build_mle_form_spec(form: dict[str, Any]) -> JobSpec:
     runtime = RuntimeProfile(
         gpu_count=form["gpus"],
         time_limit=form["time_limit"],
-        dockerfile_path=form["dockerfile_path"],
+        image=form["image"],
+        pull_policy=PullPolicy(form["pull_policy"]) if form.get("pull_policy") else None,
         run_final_validation=form["run_final_validation"],
         network_policy=NetworkPolicy.BRIDGE,
         workspace_layout=WorkspaceLayout.MLE,
@@ -224,6 +230,7 @@ def _job_view_context(job: JobRecord, *, preview: str | None = None) -> dict[str
 
 
 def create_app() -> FastAPI:
+    load_runtime_env()
     app = FastAPI(title="AiScientist Workbench")
     templates = Jinja2Templates(directory=str(repo_root() / "src" / "aisci_app" / "templates"))
     static_dir = repo_root() / "src" / "aisci_app" / "static"
@@ -242,6 +249,7 @@ def create_app() -> FastAPI:
                 "jobs": jobs,
                 "doctor_report": report,
                 "default_pdf": "",
+                "default_paper_llm_profile": default_llm_profile_name("paper"),
             },
         )
 
@@ -265,10 +273,11 @@ def create_app() -> FastAPI:
         addendum_path: str | None = Form(None),
         submission_seed_repo_zip: str | None = Form(None),
         supporting_materials: str | None = Form(None),
-        llm_profile: str = Form("gpt-5.4-responses"),
+        llm_profile: str | None = Form(None),
         gpus: int = Form(0),
         time_limit: str = Form("24h"),
-        dockerfile_path: str | None = Form(None),
+        image: str | None = Form(None),
+        pull_policy: str | None = Form(None),
         run_final_validation: bool = Form(False),
         enable_online_research: bool = Form(False),
         objective: str = Form("paper reproduction job"),
@@ -285,10 +294,11 @@ def create_app() -> FastAPI:
                 "addendum_path": addendum_path,
                 "submission_seed_repo_zip": submission_seed_repo_zip,
                 "supporting_materials": _parse_csv_list(supporting_materials),
-                "llm_profile": llm_profile,
+                "llm_profile": llm_profile or default_llm_profile_name("paper"),
                 "gpus": gpus,
                 "time_limit": time_limit,
-                "dockerfile_path": dockerfile_path,
+                "image": image,
+                "pull_policy": pull_policy,
                 "run_final_validation": run_final_validation,
                 "enable_online_research": enable_online_research,
                 "objective": objective,
@@ -327,10 +337,11 @@ def create_app() -> FastAPI:
     async def create_job(
         job_type: str = Form(...),
         objective: str = Form("workbench job"),
-        llm_profile: str = Form("gpt-5.4-responses"),
+        llm_profile: str | None = Form(None),
         gpus: int = Form(0),
         time_limit: str = Form("24h"),
-        dockerfile_path: str | None = Form(None),
+        image: str | None = Form(None),
+        pull_policy: str | None = Form(None),
         run_final_validation: bool = Form(False),
         pdf_path: str | None = Form(None),
         paper_bundle_zip: str | None = Form(None),
@@ -365,10 +376,11 @@ def create_app() -> FastAPI:
                     "addendum_path": addendum_path,
                     "submission_seed_repo_zip": submission_seed_repo_zip,
                     "supporting_materials": _parse_csv_list(supporting_materials),
-                    "llm_profile": llm_profile,
+                    "llm_profile": llm_profile or default_llm_profile_name("paper"),
                     "gpus": gpus,
                     "time_limit": time_limit,
-                    "dockerfile_path": dockerfile_path,
+                    "image": image,
+                    "pull_policy": pull_policy,
                     "run_final_validation": run_final_validation,
                     "enable_online_research": enable_online_research,
                     "objective": objective,
@@ -386,10 +398,11 @@ def create_app() -> FastAPI:
                     "validation_command": validation_command,
                     "grading_config_path": grading_config_path,
                     "metric_direction": metric_direction,
-                    "llm_profile": llm_profile,
+                    "llm_profile": llm_profile or default_llm_profile_name("mle"),
                     "gpus": gpus,
                     "time_limit": time_limit,
-                    "dockerfile_path": dockerfile_path,
+                    "image": image,
+                    "pull_policy": pull_policy,
                     "run_final_validation": run_final_validation,
                     "objective": objective,
                 }

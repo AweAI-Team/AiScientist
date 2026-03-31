@@ -35,7 +35,7 @@ def build_workspace(job_paths: JobPaths) -> PaperWorkspace:
     analysis_dir = agent_dir / "paper_analysis"
     subagent_logs_dir = logs_dir / "subagent_logs"
 
-    for path in (paper_dir, submission_dir, agent_dir, logs_dir, analysis_dir, subagent_logs_dir):
+    for path in (paper_dir, submission_dir, agent_dir, logs_dir):
         path.mkdir(parents=True, exist_ok=True)
 
     mapper = PathMapper(

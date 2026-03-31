@@ -104,8 +104,8 @@ class MLEDomainAdapter:
             shutil.copy2(Path(source).resolve(), destination)
 
     def _run_real_loop(self, job: JobRecord, job_paths) -> None:
-        profile = default_mle_profile()
-        image_tag = self.runtime.build_profile(profile, job.runtime_profile)
+        profile = default_mle_profile(job.runtime_profile.image_profile)
+        image_tag = self.runtime.prepare_image(profile, job.runtime_profile)
         spec = self.runtime.create_session_spec(
             job.id,
             job_paths,
@@ -279,7 +279,7 @@ class MLEDomainAdapter:
         return artifacts
 
     def _maybe_validate(self, job: JobRecord, job_paths) -> ValidationReport:
-        profile = default_mle_profile()
+        profile = default_mle_profile(job.runtime_profile.image_profile)
         if not job.runtime_profile.run_final_validation:
             return ValidationReport(
                 status="skipped",
@@ -306,7 +306,7 @@ class MLEDomainAdapter:
             )
         validation_command = self._validation_command(job.mode_spec, job_paths)
         try:
-            image_tag = self.runtime.build_profile(profile, job.runtime_profile)
+            image_tag = self.runtime.prepare_image(profile, job.runtime_profile)
             spec = self.runtime.create_session_spec(
                 job.id,
                 job_paths,
@@ -324,10 +324,10 @@ class MLEDomainAdapter:
         except DockerRuntimeError as exc:
             return ValidationReport(
                 status="failed",
-                summary="Final validation failed while preparing the Docker runtime.",
+                summary="Final validation failed while preparing the runtime image.",
                 details={"reason": str(exc)},
-                runtime_profile_hash="docker-build-failed",
-                container_image="build-failed",
+                runtime_profile_hash="runtime-image-failed",
+                container_image="image-prepare-failed",
             )
 
     def _validation_command(self, spec: MLESpec, job_paths) -> str:

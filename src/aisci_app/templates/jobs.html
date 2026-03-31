@@ -319,7 +319,7 @@
               </div>
               <div class="field">
                 <label>LLM profile</label>
-                <input name="llm_profile" value="gpt-5.4-responses">
+                <input name="llm_profile" value="{{ default_paper_llm_profile }}">
               </div>
               <div class="field">
                 <label>Time limit</label>
@@ -330,9 +330,18 @@
                 <input name="gpus" type="number" min="0" value="0">
               </div>
               <div class="field">
-                <label>Dockerfile override</label>
-                <input name="dockerfile_path" placeholder="/path/to/Dockerfile (advanced override)">
-                <div class="tiny muted">Optional. Leave empty to use the default paper work-environment image.</div>
+                <label>Runtime Image</label>
+                <input name="image" placeholder="aisci-paper:latest">
+                <div class="tiny muted">Optional. Leave empty to use the default image profile from config/image_profiles.yaml.</div>
+              </div>
+              <div class="field">
+                <label>Pull policy</label>
+                <select name="pull_policy">
+                  <option value="">profile default</option>
+                  <option value="if-missing">if-missing</option>
+                  <option value="always">always</option>
+                  <option value="never">never</option>
+                </select>
               </div>
             </div>
             <div class="form-grid" style="margin-top: 12px;">

@@ -1,0 +1,23 @@
+version: 1
+
+defaults:
+  default: paper-default
+  paper: paper-default
+  mle: mle-default
+
+profiles:
+  # Local-first default. Build it once with docker/build_paper_image.sh and
+  # the normal `aisci paper run` flow can reuse it without extra flags.
+  paper-default:
+    image: aisci-paper:latest
+    pull_policy: never
+
+  # Example remote profile. Replace with your published registry image if you
+  # want `if-missing` pull behavior by default.
+  paper-remote-example:
+    image: hub.byted.org/your-team/aisci-paper:latest
+    pull_policy: if-missing
+
+  mle-default:
+    image: hub.byted.org/your-team/aisci-mle:latest
+    pull_policy: if-missing

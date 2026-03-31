@@ -41,14 +41,13 @@ class PrioritizationRunner:
         rubric_path: str = "/home/paper/rubric.json",
         focus_areas: str | None = None,
     ) -> PrioritizationResult:
-        paper_analysis_root = self.engine.shell.mapped(paper_analysis_dir)
-        summary_path = paper_analysis_root / "summary.md"
-        if not summary_path.exists():
+        summary_path = f"{paper_analysis_dir.rstrip('/')}/summary.md"
+        if not self.engine.shell.file_exists(summary_path):
             raise FileNotFoundError(
                 f"Paper analysis not found at {paper_analysis_dir}/. Run read_paper first to generate the analysis files."
             )
 
-        summary = summary_path.read_text(encoding="utf-8", errors="replace")
+        summary = self.engine.shell.read_file(summary_path)
         rubric = self._safe_read(rubric_path, limit=12_000)
         addendum = self._safe_read("/home/paper/addendum.md", limit=8_000)
         blacklist = self._safe_read("/home/paper/blacklist.txt", limit=4_000)
@@ -62,21 +61,13 @@ class PrioritizationRunner:
             focus_areas=focus_areas,
         )
         config = self.engine.subagent_config("prioritization", DEFAULT_PRIORITIZATION_CONFIG)
-        subagent = PaperPrioritizationSubagent(
-            self.engine,
-            self.engine.shell,
-            self.engine.llm,
-            config,
+        output = self.engine.run_subagent_output(
+            PaperPrioritizationSubagent,
             objective="Create a prioritized implementation plan for reproducing the paper.",
             context=task_description,
-        )
-        self.engine.trace.event("subagent_start", "prioritize_tasks started.", phase="prioritize", payload={})
-        output = subagent.run(context=subagent.build_context())
-        self.engine.trace.event(
-            "subagent_finish",
-            "prioritize_tasks completed.",
+            config=config,
             phase="prioritize",
-            payload={"status": output.status.value, "log_path": output.log_path},
+            label="prioritization",
         )
 
         prioritized_path = self.engine.prioritized_path
