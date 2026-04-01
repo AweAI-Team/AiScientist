@@ -8,7 +8,7 @@ Independent AI Scientist workbench for `paper` and `mle` jobs.
 uv sync
 uv run aisci --help
 ./.venv/bin/aisci --help
-uv run aisci serve --host 127.0.0.1 --port 8080
+uv run aisci tui
 ```
 
 ## Runtime Config File
@@ -27,7 +27,7 @@ Use `.env.example` as the template, then run the CLI directly without an extra w
 Recommended mental model:
 
 - `AISCI_OUTPUT_ROOT`: where runtime outputs go, including `jobs/`, `export/`, and `.aisci/`
-- `AISCI_REPO_ROOT`: where the AiScientist repo itself lives, used to find `config/`, `src/`, and Web templates
+- `AISCI_REPO_ROOT`: where the AiScientist repo itself lives, used to find `config/` and `src/`
 
 Most users only need `AISCI_OUTPUT_ROOT`. `AISCI_REPO_ROOT` is usually unnecessary unless you launch the installed CLI from outside the repo and the process cannot infer where the checked-out AiScientist source tree is.
 
@@ -62,7 +62,7 @@ Optional but recommended:
 - `AISCI_MAX_STEPS`: overrides the default paper loop step budget (`80`)
 - `AISCI_REMINDER_FREQ`: overrides the default reminder interval (`5`)
 - `AISCI_IMAGE_PROFILE_FILE`: optional override for the runtime image profile YAML
-- `AISCI_REPO_ROOT`: advanced override for locating repo-local assets such as `config/` and Web templates
+- `AISCI_REPO_ROOT`: advanced override for locating repo-local assets such as `config/` and `src/`
 
 Sanity-check the local environment before running:
 
@@ -125,13 +125,14 @@ Other `paper run` options exposed by the current CLI:
 - `--supporting-materials PATH`: repeatable option; each file is copied into `/home/paper`
 - `--run-final-validation` / `--skip-final-validation`: default is enabled
 - `--detach` / `--wait`: default is detached
+- `--tui`: attach the live terminal dashboard; requires `--wait`
 
 Current `paper run` CLI defaults that are not user-configurable from the CLI:
 
 - `objective="paper reproduction job"`
 - `enable_online_research=True`
 
-If you need to change those values today, use the Web form or construct the `JobSpec` in Python.
+If you need to change those values today, construct the `JobSpec` in Python.
 
 ## Recommended Paper Usage
 
@@ -145,7 +146,8 @@ cp .env.example .env
 
 ./.venv/bin/aisci paper run \
   --pdf /abs/path/to/paper.pdf \
-  --wait
+  --wait \
+  --tui
 ```
 
 A more complete run with staged context:
@@ -292,6 +294,13 @@ Export a job bundle:
 uv run aisci export <job_id>
 ```
 
+Open the terminal dashboard:
+
+```bash
+uv run aisci tui
+uv run aisci tui job <job_id>
+```
+
 ## Re-Run Validation Or Resume
 
 Start a fresh self-check job from an existing paper run:
@@ -306,20 +315,22 @@ Resume from an existing paper job spec:
 uv run aisci paper resume <job_id> --wait
 ```
 
-## Web UI
+## Terminal UI
 
-Start the local Web workbench:
+The terminal dashboard is the primary visualization surface:
 
 ```bash
-uv run aisci serve --host 127.0.0.1 --port 8080
+uv run aisci tui
+uv run aisci tui job <job_id>
+uv run aisci paper run --pdf /abs/path/to/paper.pdf --wait --tui
 ```
 
-Then open `http://127.0.0.1:8080/`.
+Current TUI coverage:
 
-The Web form currently exposes a few `paper` fields that the CLI does not, including:
-
-- `objective`
-- `enable_online_research`
+- Jobs overview with live status, phase, latest event, and checks
+- Single-job detail view for overview, events, logs, and results
+- Dynamic GPU telemetry for jobs launched with `--gpu-ids`
+- Small animated scientist mascot that tracks the selected job state
 
 ## Output Layout
 
@@ -347,7 +358,7 @@ Useful files to inspect first for `paper` runs:
 - Shared Docker runtime API with per-mode default profiles
 - Upstream-aligned `paper` AI Scientist loop: `read_paper -> prioritize_tasks -> implement -> run_experiment -> clean_reproduce_validation -> submit`
 - `mle` job staging adapter with prompt-pack artifacts and validation plumbing
-- CLI commands and a minimal Web workbench for jobs, details, artifacts, and export
+- CLI commands and a terminal dashboard for jobs, details, artifacts, and export
 
 The paper mode now carries the default upstream AI Scientist execution path from
 `paperbench`. Experimental or unhooked upstream modules are intentionally not
@@ -360,4 +371,4 @@ artifact generation, and runtime unification rather than a full upstream loop.
 - `src/aisci_runtime_docker`: unified Docker runtime API
 - `src/aisci_domain_paper`: paper-mode staging and validation
 - `src/aisci_domain_mle`: mle-mode staging and validation
-- `src/aisci_app`: CLI and Web app
+- `src/aisci_app`: CLI and terminal UI

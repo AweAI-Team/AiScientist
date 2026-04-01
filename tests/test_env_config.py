@@ -5,6 +5,7 @@ import os
 from aisci_agent_runtime.llm_client import LLMConfig
 from aisci_agent_runtime.llm_profiles import default_llm_profile_name, llm_env, resolve_llm_profile
 from aisci_core.env_config import load_runtime_env
+from aisci_domain_paper.configs import load_paper_subagent_registry, resolved_paper_subagent_config_path
 from aisci_runtime_docker.profiles import default_image_profile_name, resolve_image_profile
 
 
@@ -208,3 +209,40 @@ profiles:
     assert profile.name == "paper-default"
     assert profile.image == "registry.example/aisci-paper:latest"
     assert profile.pull_policy.value == "if-missing"
+
+
+def test_paper_subagent_config_defaults_resolve_from_repo() -> None:
+    path = resolved_paper_subagent_config_path()
+    registry = load_paper_subagent_registry()
+
+    assert path.name == "paper_subagents.yaml"
+    assert registry.subagents["env_setup"].time_limit == 7200
+    assert registry.timeouts["env_setup_bash_default"] == 36000
+
+
+
+def test_paper_subagent_config_yaml_supports_overrides(tmp_path) -> None:
+    config_file = tmp_path / "paper_subagents.yaml"
+    config_file.write_text(
+        """
+subagents:
+  env_setup:
+    time_limit: 14400
+  implementation:
+    summary:
+      enabled: false
+timeouts:
+  env_setup_bash_default: 1800
+  resource_download_bash_max: 9000
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    registry = load_paper_subagent_registry(str(config_file))
+
+    assert registry.subagents["env_setup"].time_limit == 14400
+    assert registry.subagents["implementation"].summary_config is not None
+    assert registry.subagents["implementation"].summary_config.enabled is False
+    assert registry.timeouts["env_setup_bash_default"] == 1800
+    assert registry.timeouts["resource_download_bash_max"] == 9000

@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Annotated
 
 import typer
-import uvicorn
 
 from aisci_app.service import JobService
 from aisci_app.presentation import (
@@ -15,6 +15,7 @@ from aisci_app.presentation import (
     build_paper_job_spec,
     paper_doctor_report,
 )
+from aisci_app.tui import run_tui_dashboard
 from aisci_agent_runtime.llm_profiles import default_llm_profile_name
 from aisci_core.models import JobStatus, PullPolicy
 from aisci_core.env_config import load_runtime_env
@@ -27,12 +28,14 @@ mle_app = typer.Typer(help="mle mode")
 jobs_app = typer.Typer(help="inspect jobs")
 logs_app = typer.Typer(help="inspect logs")
 artifacts_app = typer.Typer(help="inspect artifacts")
+tui_app = typer.Typer(help="live terminal dashboard", invoke_without_command=True, no_args_is_help=False)
 
 app.add_typer(paper_app, name="paper")
 app.add_typer(mle_app, name="mle")
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(logs_app, name="logs")
 app.add_typer(artifacts_app, name="artifacts")
+app.add_typer(tui_app, name="tui")
 
 
 @app.callback()
@@ -105,6 +108,31 @@ def _emit_job_launch_result(
     _print_json(payload)
     if worker_value != 0 or job.status != JobStatus.SUCCEEDED:
         raise typer.Exit(code=1)
+
+
+def _is_interactive_terminal() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _run_tui_or_exit(
+    *,
+    job_id: str | None,
+    refresh_seconds: float,
+    once: bool,
+    exit_when_job_done: bool = False,
+    store: JobStore | None = None,
+):
+    try:
+        return run_tui_dashboard(
+            job_id=job_id,
+            refresh_seconds=refresh_seconds,
+            once=once,
+            exit_when_job_done=exit_when_job_done,
+            store=store,
+        )
+    except RuntimeError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
 
 
 def _print_file_tail(label: str, path: Path, lines: int) -> bool:
@@ -190,12 +218,23 @@ def run_paper(
     supporting_materials: Annotated[list[str] | None, typer.Option("--supporting-materials")] = None,
     run_final_validation: Annotated[bool, typer.Option("--run-final-validation/--skip-final-validation")] = True,
     detach: Annotated[bool, typer.Option("--detach/--wait")] = True,
+    tui: Annotated[
+        bool,
+        typer.Option(
+            "--tui",
+            help="Attach the live terminal dashboard after starting the job. Requires --wait and an interactive terminal.",
+        ),
+    ] = False,
 ) -> None:
     service = JobService()
     selected_llm_profile = llm_profile or default_llm_profile_name("paper")
     gpu_ids = _parse_gpu_ids(gpu_ids_raw)
     if gpu_ids and gpus > 0:
         raise typer.BadParameter("Use either --gpus <count> or --gpu-ids <id,id>, not both.")
+    if tui and detach:
+        raise typer.BadParameter("--tui requires --wait.")
+    if tui and not _is_interactive_terminal():
+        raise typer.BadParameter("--tui requires an interactive terminal.")
     spec = build_paper_job_spec(
         pdf_path=pdf,
         paper_bundle_zip=paper_bundle_zip,
@@ -216,6 +255,22 @@ def run_paper(
     )
     job = service.create_job(spec)
     wait = not detach
+    if tui:
+        worker_pid = service.spawn_worker(job.id, wait=False)
+        result = _run_tui_or_exit(
+            job_id=job.id,
+            refresh_seconds=2.0,
+            once=False,
+            exit_when_job_done=True,
+            store=service.store,
+        )
+        if result.detached:
+            _emit_job_launch_result(service, job.id, worker_pid, wait=False)
+            return
+        final_job = service.store.get_job(job.id)
+        if final_job.status != JobStatus.SUCCEEDED:
+            raise typer.Exit(code=1)
+        return
     worker_value = service.spawn_worker(job.id, wait=wait)
     _emit_job_launch_result(service, job.id, worker_value, wait=wait)
 
@@ -231,7 +286,7 @@ def paper_doctor(json_output: Annotated[bool, typer.Option("--json/--text")] = F
         typer.echo(f"- {check.name}: {check.status} ({check.detail})")
     typer.echo("")
     typer.echo("Start a paper job with:")
-    typer.echo("  aisci paper run --pdf /path/to/paper.pdf")
+    typer.echo("  aisci paper run --pdf /path/to/paper.pdf --wait --tui")
 
 
 @paper_app.command("validate")
@@ -388,15 +443,28 @@ def artifacts_ls(job_id: str) -> None:
     _print_json(payload)
 
 
+@tui_app.callback()
+def tui_root(
+    ctx: typer.Context,
+    refresh: Annotated[float, typer.Option("--refresh", help="Refresh interval in seconds.")] = 2.0,
+    once: Annotated[bool, typer.Option("--once", help="Render a single frame and exit.")] = False,
+) -> None:
+    if ctx.invoked_subcommand is not None:
+        return
+    _run_tui_or_exit(job_id=None, refresh_seconds=refresh, once=once)
+
+
+@tui_app.command("job")
+def tui_job(
+    job_id: str,
+    refresh: Annotated[float, typer.Option("--refresh", help="Refresh interval in seconds.")] = 2.0,
+    once: Annotated[bool, typer.Option("--once", help="Render a single frame and exit.")] = False,
+) -> None:
+    _get_job_or_exit(job_id)
+    _run_tui_or_exit(job_id=job_id, refresh_seconds=refresh, once=once)
+
+
 @app.command("export")
 def export_job(job_id: str) -> None:
     path = JobService().export_bundle(job_id)
     typer.echo(str(path))
-
-
-@app.command("serve")
-def serve(
-    host: Annotated[str, typer.Option("--host")] = "127.0.0.1",
-    port: Annotated[int, typer.Option("--port")] = 8080,
-) -> None:
-    uvicorn.run("aisci_app.web:create_app", host=host, port=port, factory=True, reload=False)

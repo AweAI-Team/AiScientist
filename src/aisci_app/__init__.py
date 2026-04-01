@@ -1,2 +1,1 @@
-"""CLI and web app for AiScientist."""
-
+"""CLI and terminal UI for AiScientist."""

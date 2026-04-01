@@ -13,6 +13,10 @@ from aisci_domain_paper.configs import (
     DEFAULT_PAPER_STRUCTURE_CONFIG,
     DEFAULT_PAPER_SYNTHESIS_CONFIG,
     DEFAULT_PRIORITIZATION_CONFIG,
+    ENV_SETUP_BASH_DEFAULT_TIMEOUT,
+    ENV_SETUP_BASH_MAX_TIMEOUT,
+    RESOURCE_DOWNLOAD_BASH_DEFAULT_TIMEOUT,
+    RESOURCE_DOWNLOAD_BASH_MAX_TIMEOUT,
 )
 from aisci_domain_paper.engine import EmbeddedPaperEngine, PaperRuntimeConfig
 from aisci_domain_paper.subagents import subagent_class_for_kind
@@ -29,9 +33,11 @@ from aisci_domain_paper.tools.basic_tool import (
     build_general_tools,
     build_implementation_tools,
     build_main_direct_tools,
+    build_env_setup_tools,
     build_prioritization_tools,
     build_reader_tools,
     build_plan_tools,
+    build_resource_download_tools,
 )
 from aisci_domain_paper.tools.clean_validation_tool import CleanReproduceValidationTool
 from aisci_domain_paper.tools.implementation_tool import ImplementationTool
@@ -596,3 +602,13 @@ def test_search_file_missing_path_is_nonfatal() -> None:
     result = SearchFileTool().execute(Shell(), pattern="PINN", path="/home/paper/addendum.md")
 
     assert result == "File not found: /home/paper/addendum.md. It may be optional or not staged for this run."
+
+
+def test_env_setup_and_resource_download_tools_use_configured_timeouts() -> None:
+    env_bash = next(tool for tool in build_env_setup_tools() if tool.name() == "bash")
+    download_bash = next(tool for tool in build_resource_download_tools() if tool.name() == "bash")
+
+    assert env_bash.default_timeout == ENV_SETUP_BASH_DEFAULT_TIMEOUT
+    assert env_bash.max_timeout == ENV_SETUP_BASH_MAX_TIMEOUT
+    assert download_bash.default_timeout == RESOURCE_DOWNLOAD_BASH_DEFAULT_TIMEOUT
+    assert download_bash.max_timeout == RESOURCE_DOWNLOAD_BASH_MAX_TIMEOUT

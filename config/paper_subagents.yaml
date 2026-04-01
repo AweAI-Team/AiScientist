@@ -1,0 +1,74 @@
+subagents:
+  implementation:
+    max_steps: 500
+    time_limit: 28800
+    reminder_freq: 20
+    summary:
+      enabled: true
+
+  experiment:
+    max_steps: 500
+    time_limit: 36000
+    reminder_freq: 30
+    summary:
+      enabled: true
+
+  env_setup:
+    max_steps: 500
+    time_limit: 7200
+    reminder_freq: 15
+
+  resource_download:
+    max_steps: 500
+    time_limit: 7200
+    reminder_freq: 15
+
+  paper_structure:
+    max_steps: 500
+    time_limit: 36000
+    reminder_freq: 15
+
+  paper_reader:
+    max_steps: 500
+    time_limit: 36000
+    reminder_freq: 15
+
+  paper_synthesis:
+    max_steps: 500
+    time_limit: 36000
+    reminder_freq: 15
+
+  prioritization:
+    max_steps: 500
+    time_limit: 36000
+    reminder_freq: 15
+
+  explore:
+    max_steps: 500
+    time_limit: 14400
+    reminder_freq: 15
+
+  plan:
+    max_steps: 500
+    time_limit: 7200
+    reminder_freq: 15
+
+  general:
+    max_steps: 300
+    time_limit: 14400
+    reminder_freq: 20
+
+timeouts:
+  main_agent_bash_default: 36000
+  main_agent_bash_max: 86400
+  implementation_bash_default: 36000
+  experiment_bash_default: 36000
+  experiment_command_timeout: 36000
+  experiment_validate_time_limit: 18000
+  env_setup_bash_default: 36000
+  env_setup_bash_max: 36000
+  resource_download_bash_default: 600
+  resource_download_bash_max: 7200
+  explore_bash_default: 36000
+  plan_bash_default: 36000
+  general_bash_default: 36000

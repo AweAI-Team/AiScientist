@@ -466,7 +466,7 @@ def paper_doctor_report() -> list[PaperDoctorCheck]:
         PaperDoctorCheck(
             "paper console",
             "ok",
-            "CLI: aisci paper run / doctor / validate / resume; Web: / and /jobs/<id>.",
+            "CLI: aisci paper run / doctor / validate / resume; TUI: aisci tui and aisci tui job <id>.",
         )
     )
     return checks

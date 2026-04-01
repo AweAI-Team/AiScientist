@@ -72,7 +72,7 @@ class RuntimeProfile(BaseModel):
     image_profile: str | None = None
     pull_policy: PullPolicy | None = None
     run_final_validation: bool = False
-    network_policy: NetworkPolicy = NetworkPolicy.BRIDGE
+    network_policy: NetworkPolicy = NetworkPolicy.HOST
     gpu_ids: list[str] = Field(default_factory=list)
     workspace_layout: WorkspaceLayout | None = None
     uid_gid_mode: UIDGIDMode = UIDGIDMode.HOST

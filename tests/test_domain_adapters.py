@@ -197,6 +197,10 @@ def test_default_paper_profile_uses_repo_image_config(tmp_path: Path, monkeypatc
     assert profile.pull_policy == PullPolicy.IF_MISSING
 
 
+def test_runtime_profile_defaults_to_host_network() -> None:
+    assert RuntimeProfile().network_policy == NetworkPolicy.HOST
+
+
 def test_prepare_image_if_missing_pulls_when_absent(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AISCI_REPO_ROOT", str(tmp_path))
     _write_image_config(tmp_path)

@@ -10,6 +10,13 @@ from typer.testing import CliRunner
 from aisci_app.cli import _log_targets_for_kind, app
 from aisci_app.worker_main import main as worker_main
 from aisci_app.presentation import paper_doctor_report, paper_job_summary
+from aisci_app.tui import (
+    TUIRunResult,
+    _conversation_view_text,
+    _format_recent_event_text,
+    _workspace_tree_text,
+    parse_nvidia_smi_csv,
+)
 from aisci_core.models import JobRecord, JobSpec, JobStatus, JobType, PaperSpec, RunPhase, RuntimeProfile, WorkspaceLayout
 from aisci_core.paths import ensure_job_dirs, resolve_job_paths
 from aisci_core.store import JobStore
@@ -56,10 +63,28 @@ def _create_paper_job(tmp_path: Path):
     paths = ensure_job_dirs(resolve_job_paths(job.id))
     (paths.logs_dir / "job.log").write_text("main log line\n", encoding="utf-8")
     (paths.logs_dir / "conversation.jsonl").write_text(
-        json.dumps({"event_type": "model_response", "phase": "analyze", "message": "hello"}) + "\n",
+        (
+            json.dumps({"event_type": "model_response", "phase": "analyze", "message": "paper analysis started"})
+            + "\n"
+            + json.dumps({"event_type": "subagent_start", "phase": "implement", "message": "implementation subagent started."})
+            + "\n"
+        ),
         encoding="utf-8",
     )
     (paths.logs_dir / "agent.log").write_text("agent log line\n", encoding="utf-8")
+    (paths.logs_dir / "paper_session_state.json").write_text(
+        json.dumps(
+            {
+                "summary": "paper summary for TUI",
+                "impl_runs": 2,
+                "exp_runs": 1,
+                "self_checks": 1,
+                "submit_attempts": 1,
+                "clean_validation_called": True,
+            }
+        ),
+        encoding="utf-8",
+    )
     (paths.logs_dir / "subagent_logs").mkdir(parents=True, exist_ok=True)
     (paths.logs_dir / "subagent_logs" / "implement_001_20260331_120000").mkdir(parents=True, exist_ok=True)
     (paths.workspace_dir / "submission").mkdir(parents=True, exist_ok=True)
@@ -69,6 +94,11 @@ def _create_paper_job(tmp_path: Path):
     (paths.workspace_dir / "agent" / "plan.md").write_text("# plan\n", encoding="utf-8")
     (paths.workspace_dir / "agent" / "impl_log.md").write_text("# impl\n", encoding="utf-8")
     (paths.workspace_dir / "agent" / "exp_log.md").write_text("# exp\n", encoding="utf-8")
+    (paths.workspace_dir / "agent" / "final_self_check.json").write_text(
+        json.dumps({"status": "passed", "result": "self check ok"}),
+        encoding="utf-8",
+    )
+    (paths.workspace_dir / "agent" / "final_self_check.md").write_text("# self-check\n", encoding="utf-8")
     (paths.state_dir / "resolved_llm_config.json").write_text(
         json.dumps({"profile": "paper-default", "backend": "openai"}),
         encoding="utf-8",
@@ -84,7 +114,11 @@ def _create_paper_job(tmp_path: Path):
         encoding="utf-8",
     )
     (paths.state_dir / "sandbox_session.json").write_text(
-        json.dumps({"container_name": "paper-test-session"}),
+        json.dumps({"container_name": "paper-test-session", "image_ref": "aisci-paper:test"}),
+        encoding="utf-8",
+    )
+    (paths.artifacts_dir / "validation_report.json").write_text(
+        json.dumps({"status": "passed", "summary": "validation ok"}),
         encoding="utf-8",
     )
     (paths.workspace_dir / "submission" / "reproduce.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
@@ -119,6 +153,65 @@ def test_paper_doctor_reports_console_tip() -> None:
     report = paper_doctor_report()
     assert any(check.name == "paper console" for check in report)
     assert any(check.name == "online_research" for check in report)
+
+
+def test_parse_nvidia_smi_csv_extracts_metrics() -> None:
+    rows = parse_nvidia_smi_csv("0, NVIDIA A100, 78, 10240, 40960, 63\n")
+    assert rows[0].index == "0"
+    assert rows[0].utilization == 78
+    assert rows[0].memory_total == 40960
+
+
+def test_workspace_tree_text_renders_home_style_tree(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    (workspace / "agent" / "paper_analysis").mkdir(parents=True)
+    (workspace / "submission").mkdir(parents=True)
+    (workspace / "submission" / "reproduce.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+
+    rendered = _workspace_tree_text(workspace, depth=2)
+
+    assert "/home" in rendered
+    assert "agent/" in rendered
+    assert "paper_analysis/" in rendered
+    assert "submission/" in rendered
+    assert "reproduce.sh" in rendered
+
+
+def test_conversation_view_text_normalizes_records(tmp_path: Path) -> None:
+    path = tmp_path / "conversation.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                json.dumps({"event": "model_response", "step": 3, "phase": "implement", "text": "Working on the core implementation."}),
+                json.dumps({"event": "tool_result", "step": 3, "tool": "bash", "result_preview": "pytest passed"}),
+                json.dumps({"event_type": "subagent_start", "phase": "validate", "message": "experiment subagent started."}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    rendered = _conversation_view_text(path, limit=10)
+
+    assert "step 3 [implement] agent: Working on the core implementation." in rendered
+    assert "step 3 bash: pytest passed" in rendered
+    assert "[validate] experiment subagent started." in rendered
+
+
+def test_format_recent_event_text_applies_structured_prefixes() -> None:
+    rendered = _format_recent_event_text(
+        {
+            "event_type": "subagent_start",
+            "step": 7,
+            "phase": "analyze",
+            "message": "paper_structure subagent started.",
+        }
+    )
+
+    assert rendered.plain == "step 7  [analyze]  paper_structure subagent started."
+    assert any(span.style == "bold cyan" for span in rendered.spans)
+    assert any(span.style == "magenta" for span in rendered.spans)
+    assert any(span.style == "yellow" for span in rendered.spans)
 
 
 def test_cli_global_env_file_option_loads_api_key(tmp_path: Path, monkeypatch) -> None:
@@ -231,3 +324,99 @@ def test_paper_run_rejects_gpu_count_and_ids_together(tmp_path: Path) -> None:
 
     assert result.exit_code != 0
     assert "Use either --gpus <count> or --gpu-ids <id,id>, not both." in (result.stdout + result.stderr)
+
+
+def test_paper_run_tui_requires_wait(tmp_path: Path) -> None:
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        ["paper", "run", "--pdf", str(tmp_path / "paper.pdf"), "--detach", "--tui"],
+    )
+
+    assert result.exit_code != 0
+    assert "--tui requires --wait." in (result.stdout + result.stderr)
+
+
+def test_paper_run_tui_detach_emits_started_payload(monkeypatch, tmp_path: Path) -> None:
+    runner = CliRunner()
+    created_job = _paper_job_record(status=JobStatus.PENDING, phase=RunPhase.INGEST)
+    captured: dict[str, object] = {}
+
+    class _Service:
+        def __init__(self) -> None:
+            self.store = None
+
+        def create_job(self, spec) -> JobRecord:  # noqa: ANN001
+            return created_job
+
+        def spawn_worker(self, job_id: str, wait: bool = False) -> int:
+            captured["job_id"] = job_id
+            captured["wait"] = wait
+            return 4242
+
+    monkeypatch.setattr("aisci_app.cli.JobService", _Service)
+    monkeypatch.setattr("aisci_app.cli.build_paper_job_spec", lambda **kwargs: object())
+    monkeypatch.setattr("aisci_app.cli._is_interactive_terminal", lambda: True)
+    monkeypatch.setattr(
+        "aisci_app.cli._run_tui_or_exit",
+        lambda **kwargs: TUIRunResult(job_id=created_job.id, completed=False, detached=True),
+    )
+
+    result = runner.invoke(
+        app,
+        ["paper", "run", "--pdf", str(tmp_path / "paper.pdf"), "--wait", "--tui"],
+    )
+
+    assert result.exit_code == 0
+    assert captured["wait"] is False
+    payload = json.loads(result.stdout)
+    assert payload["job_id"] == created_job.id
+    assert payload["status"] == "started"
+    assert payload["worker"] == 4242
+
+
+def test_tui_once_renders_jobs(monkeypatch, tmp_path: Path) -> None:
+    runner = CliRunner()
+    monkeypatch.setenv("AISCI_OUTPUT_ROOT", str(tmp_path))
+    monkeypatch.setenv("AISCI_REPO_ROOT", str(tmp_path))
+    job, _ = _create_paper_job(tmp_path)
+    monkeypatch.setattr("aisci_app.tui.query_nvidia_smi", lambda command=None: ([], "nvidia-smi unavailable"))
+
+    result = runner.invoke(app, ["tui", "--once"])
+
+    assert result.exit_code == 0
+    assert "AiScientist" in result.stdout
+    assert job.id in result.stdout
+    assert "Selected Job" in result.stdout
+    assert "Terminal TUI" not in result.stdout
+    assert "ai-sci" not in result.stdout
+
+
+def test_tui_job_once_renders_detail(monkeypatch, tmp_path: Path) -> None:
+    runner = CliRunner()
+    monkeypatch.setenv("AISCI_OUTPUT_ROOT", str(tmp_path))
+    monkeypatch.setenv("AISCI_REPO_ROOT", str(tmp_path))
+    job, _ = _create_paper_job(tmp_path)
+    monkeypatch.setattr("aisci_app.tui.query_nvidia_smi", lambda command=None: ([], "nvidia-smi unavailable"))
+
+    result = runner.invoke(app, ["tui", "job", job.id, "--once"])
+
+    assert result.exit_code == 0
+    assert f"Job {job.id}" in result.stdout
+    assert "Overview" in result.stdout
+    assert "[4] conversation" in result.stdout
+    assert "implement" in result.stdout
+    assert "Subagent Calls" in result.stdout
+    assert "Capabilities" not in result.stdout
+    assert "validation_mode" not in result.stdout
+    assert "self_check" not in result.stdout
+
+
+def test_serve_command_removed() -> None:
+    runner = CliRunner()
+
+    result = runner.invoke(app, ["serve"])
+
+    assert result.exit_code != 0
+    assert "No such command 'serve'" in (result.stdout + result.stderr)

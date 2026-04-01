@@ -15,4 +15,8 @@ uv run aisci --env-file /data03/chenguoxin.cgx/wksp/ai_workspace/dev/case/.env \
   --llm-profile "${LLM_PROFILE}" \
   --gpu-ids "${GPU_IDS}" \
   --time-limit "${TIME_LIMIT}" \
+  --tui \
   --wait
+
+
+# aisci --output-root /data03/chenguoxin.cgx/wksp/ai_workspace/output_dir/cli/ tui

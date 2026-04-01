@@ -17,11 +17,15 @@ from aisci_agent_runtime.tools.shell_tools import (
     SearchFileTool,
 )
 from aisci_domain_paper.configs import (
+    ENV_SETUP_BASH_DEFAULT_TIMEOUT,
+    ENV_SETUP_BASH_MAX_TIMEOUT,
     EXPERIMENT_BASH_DEFAULT_TIMEOUT,
     EXPERIMENT_COMMAND_TIMEOUT,
     IMPLEMENTATION_BASH_DEFAULT_TIMEOUT,
     MAIN_AGENT_BASH_DEFAULT_TIMEOUT,
     MAIN_AGENT_BASH_MAX_TIMEOUT,
+    RESOURCE_DOWNLOAD_BASH_DEFAULT_TIMEOUT,
+    RESOURCE_DOWNLOAD_BASH_MAX_TIMEOUT,
 )
 
 
@@ -526,7 +530,7 @@ def build_env_setup_tools() -> list[Tool]:
 
     return [
         ReadFileChunkTool(),
-        BashToolWithTimeout(default_timeout=600, max_timeout=3600),
+        BashToolWithTimeout(default_timeout=ENV_SETUP_BASH_DEFAULT_TIMEOUT, max_timeout=ENV_SETUP_BASH_MAX_TIMEOUT),
         MappedFileEditTool(),
         SubagentCompleteTool(),
     ]
@@ -537,7 +541,7 @@ def build_resource_download_tools(capabilities: dict[str, Any] | None = None) ->
 
     tools: list[Tool] = [
         ReadFileChunkTool(),
-        BashToolWithTimeout(default_timeout=900, max_timeout=7200),
+        BashToolWithTimeout(default_timeout=RESOURCE_DOWNLOAD_BASH_DEFAULT_TIMEOUT, max_timeout=RESOURCE_DOWNLOAD_BASH_MAX_TIMEOUT),
         PythonTool(default_timeout=900, max_timeout=7200),
         MappedFileEditTool(),
     ]
