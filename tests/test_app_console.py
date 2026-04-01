@@ -5,6 +5,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+from rich.console import Console
 from typer.testing import CliRunner
 
 from aisci_app.cli import _log_targets_for_kind, app
@@ -15,8 +16,12 @@ from aisci_app.tui import (
     _conversation_view_text,
     _select_recent_feed_records,
     _format_recent_event_text,
+    _log_panel_layout,
+    _render_recent_events,
+    _truncate_block_lines,
     _workspace_tree_text,
     parse_nvidia_smi_csv,
+    parse_nvidia_smi_process_csv,
 )
 from aisci_core.models import JobRecord, JobSpec, JobStatus, JobType, PaperSpec, RunPhase, RuntimeProfile, WorkspaceLayout
 from aisci_core.paths import ensure_job_dirs, resolve_job_paths
@@ -157,10 +162,20 @@ def test_paper_doctor_reports_console_tip() -> None:
 
 
 def test_parse_nvidia_smi_csv_extracts_metrics() -> None:
-    rows = parse_nvidia_smi_csv("0, NVIDIA A100, 78, 10240, 40960, 63\n")
+    rows = parse_nvidia_smi_csv("0, GPU-test-uuid, NVIDIA A100, 78, 10240, 40960, 63\n")
     assert rows[0].index == "0"
+    assert rows[0].uuid == "GPU-test-uuid"
     assert rows[0].utilization == 78
     assert rows[0].memory_total == 40960
+
+
+def test_parse_nvidia_smi_process_csv_extracts_processes() -> None:
+    rows = parse_nvidia_smi_process_csv("GPU-test-uuid, 12345, python3, 2048\n")
+
+    assert rows[0].gpu_uuid == "GPU-test-uuid"
+    assert rows[0].pid == 12345
+    assert rows[0].process_name == "python3"
+    assert rows[0].used_gpu_memory == 2048
 
 
 def test_workspace_tree_text_renders_home_style_tree(tmp_path: Path) -> None:
@@ -176,6 +191,19 @@ def test_workspace_tree_text_renders_home_style_tree(tmp_path: Path) -> None:
     assert "paper_analysis/" in rendered
     assert "submission/" in rendered
     assert "reproduce.sh" in rendered
+
+
+def test_truncate_block_lines_adds_ellipsis_when_over_limit() -> None:
+    text = "a\nb\nc\nd"
+    assert _truncate_block_lines(text, max_lines=3) == "a\nb\n..."
+
+
+def test_log_panel_layout_prioritizes_agent_log_height() -> None:
+    layout = _log_panel_layout(28, names=["job.log", "agent.log"])
+
+    assert layout["job.log"] == (9, 4)
+    assert layout["agent.log"][0] == 19
+    assert layout["agent.log"][1] == 14
 
 
 def test_conversation_view_text_normalizes_records(tmp_path: Path) -> None:
@@ -227,6 +255,40 @@ def test_recent_feed_prefers_operational_events_over_agent_transcript() -> None:
     assert len(selected) == 2
     assert selected[0]["event_type"] == "tool_result"
     assert selected[1]["event_type"] == "subagent_start"
+
+
+def test_render_recent_events_keeps_latest_last() -> None:
+    console = Console(width=120, record=True, force_terminal=False)
+    renderable = _render_recent_events(
+        [
+            {"event_type": "subagent_start", "phase": "analyze", "message": "first started"},
+            {"event_type": "subagent_finish", "phase": "analyze", "message": "second finished"},
+        ]
+    )
+    console.print(renderable)
+    text = console.export_text()
+
+    assert text.index("first started") < text.index("second finished")
+
+
+def test_render_recent_events_truncates_from_top() -> None:
+    console = Console(width=120, record=True, force_terminal=False)
+    renderable = _render_recent_events(
+        [
+            {"event_type": "subagent_start", "phase": "analyze", "message": "first started"},
+            {"event_type": "subagent_finish", "phase": "analyze", "message": "second finished"},
+            {"event_type": "subagent_finish", "phase": "analyze", "message": "third finished"},
+            {"event_type": "subagent_finish", "phase": "analyze", "message": "fourth finished"},
+        ],
+        max_items=3,
+    )
+    console.print(renderable)
+    text = console.export_text()
+
+    assert "..." in text
+    assert "first started" not in text
+    assert "second finished" not in text
+    assert text.index("third finished") < text.index("fourth finished")
 
 
 def test_cli_global_env_file_option_loads_api_key(tmp_path: Path, monkeypatch) -> None:

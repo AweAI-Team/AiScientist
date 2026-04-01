@@ -32,9 +32,16 @@ GPU_REFRESH_SECONDS = 1.0
 MASCOT_FRAME_SECONDS = 2.0
 EVENT_LIMIT = 8
 PREVIEW_LINES = 18
+GPU_HISTORY_LENGTH = 20
+GPU_TEMP_MAX = 95
 GPU_QUERY = [
     "nvidia-smi",
-    "--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu",
+    "--query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total,temperature.gpu",
+    "--format=csv,noheader,nounits",
+]
+GPU_PROCESS_QUERY = [
+    "nvidia-smi",
+    "--query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory",
     "--format=csv,noheader,nounits",
 ]
 DETAIL_TABS = ("overview", "events", "logs", "conversation")
@@ -256,10 +263,26 @@ MASCOT_FRAMES: dict[str, list[list[str]]] = {
 @dataclass(frozen=True)
 class GpuStat:
     index: str
+    uuid: str
     name: str
     utilization: int | None
     memory_used: int | None
     memory_total: int | None
+    temperature: int | None
+
+
+@dataclass(frozen=True)
+class GpuProcess:
+    gpu_uuid: str
+    pid: int
+    process_name: str
+    used_gpu_memory: int | None
+
+
+@dataclass(frozen=True)
+class GpuHistoryPoint:
+    utilization: int | None
+    memory_percent: int | None
     temperature: int | None
 
 
@@ -287,7 +310,10 @@ class JobDetail:
     artifact_tree: str
     conversation_view: str
     gpu_stats: list[GpuStat]
+    gpu_processes: list[GpuProcess]
+    gpu_history: dict[str, list[GpuHistoryPoint]]
     gpu_error: str | None
+    gpu_process_error: str | None
     subagent_counts: list[tuple[str, int]]
 
 
@@ -315,17 +341,38 @@ class TUIRunResult:
 def parse_nvidia_smi_csv(text: str) -> list[GpuStat]:
     rows = []
     for raw_row in csv.reader(line for line in text.splitlines() if line.strip()):
-        if len(raw_row) < 6:
+        if len(raw_row) < 7:
             continue
-        index, name, util, mem_used, mem_total, temperature = [item.strip() for item in raw_row[:6]]
+        index, uuid, name, util, mem_used, mem_total, temperature = [item.strip() for item in raw_row[:7]]
         rows.append(
             GpuStat(
                 index=index,
+                uuid=uuid,
                 name=name,
                 utilization=_parse_int(util),
                 memory_used=_parse_int(mem_used),
                 memory_total=_parse_int(mem_total),
                 temperature=_parse_int(temperature),
+            )
+        )
+    return rows
+
+
+def parse_nvidia_smi_process_csv(text: str) -> list[GpuProcess]:
+    rows = []
+    for raw_row in csv.reader(line for line in text.splitlines() if line.strip()):
+        if len(raw_row) < 4:
+            continue
+        gpu_uuid, pid, process_name, used_gpu_memory = [item.strip() for item in raw_row[:4]]
+        parsed_pid = _parse_int(pid)
+        if parsed_pid is None:
+            continue
+        rows.append(
+            GpuProcess(
+                gpu_uuid=gpu_uuid,
+                pid=parsed_pid,
+                process_name=process_name or "-",
+                used_gpu_memory=_parse_int(used_gpu_memory),
             )
         )
     return rows
@@ -348,6 +395,25 @@ def query_nvidia_smi(command: list[str] | None = None) -> tuple[list[GpuStat], s
         detail = (completed.stderr or completed.stdout or "nvidia-smi failed").strip()
         return [], detail
     return parse_nvidia_smi_csv(completed.stdout), None
+
+
+def query_nvidia_smi_processes(command: list[str] | None = None) -> tuple[list[GpuProcess], str | None]:
+    try:
+        completed = subprocess.run(
+            command or GPU_PROCESS_QUERY,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=3,
+        )
+    except FileNotFoundError:
+        return [], "nvidia-smi not found"
+    except Exception as exc:  # noqa: BLE001
+        return [], str(exc)
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "nvidia-smi compute-apps failed").strip()
+        return [], detail
+    return parse_nvidia_smi_process_csv(completed.stdout), None
 
 
 def run_tui_dashboard(
@@ -392,7 +458,10 @@ class _DashboardApp:
         self.message = ""
         self._last_gpu_poll = 0.0
         self._gpu_stats: list[GpuStat] = []
+        self._gpu_processes: list[GpuProcess] = []
+        self._gpu_history: dict[str, list[GpuHistoryPoint]] = {}
         self._gpu_error: str | None = None
+        self._gpu_process_error: str | None = None
         self._selected_index = 0
         self._job_ids: list[str] = []
         self._focus_job_id = initial_job_id
@@ -454,11 +523,11 @@ class _DashboardApp:
         elif jobs:
             self._focus_job_id = jobs[self._selected_index].job.id
 
-        stats, error = self._current_gpu_metrics()
+        stats, processes, error, process_error = self._current_gpu_metrics()
         detail = None
         if jobs:
             selected = jobs[self._selected_index]
-            detail = self._build_detail(selected, stats, error)
+            detail = self._build_detail(selected, stats, processes, error, process_error)
         return DashboardSnapshot(
             jobs=jobs,
             selected_index=self._selected_index,
@@ -487,7 +556,9 @@ class _DashboardApp:
         self,
         row: JobRow,
         gpu_stats: list[GpuStat],
+        gpu_processes: list[GpuProcess],
         gpu_error: str | None,
+        gpu_process_error: str | None,
     ) -> JobDetail:
         job = row.job
         paths = ensure_job_dirs(resolve_job_paths(job.id))
@@ -501,7 +572,11 @@ class _DashboardApp:
                 artifact_lines.append(f"{hint.label}: {Path(hint.path).name}")
         artifact_lines = artifact_lines[:8]
         selected_gpu_ids = list(job.runtime_profile.gpu_ids)
-        selected_gpu_stats = [stat for stat in gpu_stats if stat.index in selected_gpu_ids]
+        stats_by_index = {stat.index: stat for stat in gpu_stats}
+        selected_gpu_stats = [stats_by_index[gpu_id] for gpu_id in selected_gpu_ids if gpu_id in stats_by_index]
+        selected_gpu_uuids = {stat.uuid for stat in selected_gpu_stats}
+        selected_gpu_processes = [process for process in gpu_processes if process.gpu_uuid in selected_gpu_uuids]
+        selected_gpu_history = {stat.index: list(self._gpu_history.get(stat.index, [])) for stat in selected_gpu_stats}
         return JobDetail(
             row=row,
             main_step=_latest_step(paths.logs_dir / "conversation.jsonl"),
@@ -515,20 +590,43 @@ class _DashboardApp:
                 "agent.log": _tail_text(paths.logs_dir / "agent.log", PREVIEW_LINES),
             },
             artifact_lines=artifact_lines,
-            artifact_tree=_workspace_tree_text(paths.workspace_dir, depth=3),
+            artifact_tree=_workspace_tree_text(paths.workspace_dir, depth=2),
             conversation_view=_conversation_view_text(paths.logs_dir / "conversation.jsonl", limit=24),
             gpu_stats=selected_gpu_stats,
+            gpu_processes=selected_gpu_processes,
+            gpu_history=selected_gpu_history,
             gpu_error=gpu_error,
+            gpu_process_error=gpu_process_error,
             subagent_counts=_collect_subagent_counts(paths.logs_dir / "conversation.jsonl"),
         )
 
-    def _current_gpu_metrics(self) -> tuple[list[GpuStat], str | None]:
+    def _current_gpu_metrics(self) -> tuple[list[GpuStat], list[GpuProcess], str | None, str | None]:
         now = time.monotonic()
         if now - self._last_gpu_poll < GPU_REFRESH_SECONDS:
-            return self._gpu_stats, self._gpu_error
+            return self._gpu_stats, self._gpu_processes, self._gpu_error, self._gpu_process_error
         self._gpu_stats, self._gpu_error = query_nvidia_smi()
+        if not self._gpu_error:
+            self._remember_gpu_history(self._gpu_stats)
+        self._gpu_processes, self._gpu_process_error = query_nvidia_smi_processes()
         self._last_gpu_poll = now
-        return self._gpu_stats, self._gpu_error
+        return self._gpu_stats, self._gpu_processes, self._gpu_error, self._gpu_process_error
+
+    def _remember_gpu_history(self, stats: list[GpuStat]) -> None:
+        seen = set()
+        for stat in stats:
+            seen.add(stat.index)
+            history = list(self._gpu_history.get(stat.index, []))
+            history.append(
+                GpuHistoryPoint(
+                    utilization=stat.utilization,
+                    memory_percent=_memory_percent(stat),
+                    temperature=stat.temperature,
+                )
+            )
+            self._gpu_history[stat.index] = history[-GPU_HISTORY_LENGTH:]
+        for index in list(self._gpu_history.keys()):
+            if index not in seen:
+                self._gpu_history[index] = self._gpu_history[index][-GPU_HISTORY_LENGTH:]
 
     def _attached_job_finished(self, snapshot: DashboardSnapshot) -> bool:
         selected = snapshot.selected
@@ -710,7 +808,11 @@ class _DashboardApp:
         if sidebar is None:
             return main
         if self.console.size.width >= 140:
-            return Columns([main, sidebar], expand=True, equal=False)
+            grid = Table.grid(expand=True)
+            grid.add_column(ratio=2)
+            grid.add_column(ratio=1)
+            grid.add_row(main, sidebar)
+            return grid
         return Group(main, sidebar)
 
     def _render_detail_main(self, detail: JobDetail) -> RenderableType:
@@ -732,6 +834,9 @@ class _DashboardApp:
             Panel(tab_line, title=f"Job {detail.row.job.id}", box=box.ROUNDED, border_style="cyan"),
             body,
         )
+
+    def _detail_fill_height(self) -> int:
+        return max(self.console.size.height - 10, 8)
 
     def _render_detail_sidebar(self, detail: JobDetail) -> RenderableType | None:
         _ = detail
@@ -772,24 +877,50 @@ class _DashboardApp:
         )
 
     def _render_events(self, detail: JobDetail) -> RenderableType:
-        body = _render_recent_events(detail.recent_events)
+        total_height = self._detail_fill_height()
+        if self.console.size.width >= 140:
+            artifact_height = total_height
+            events_height = total_height
+        else:
+            artifact_height, events_height = _split_heights(total_height, parts=2, min_height=6)
+
+        artifact_lines = max(artifact_height - 4, 3)
+        event_lines = max(events_height - 4, 3)
+        records = _recent_events(detail.row.job, limit=max(event_lines * 2, EVENT_LIMIT))
+        body = _render_recent_events(records, max_items=event_lines)
         artifacts_panel = Panel(
-            Text(detail.artifact_tree, style="bright_black"),
+            Text(_truncate_block_lines(detail.artifact_tree, max_lines=artifact_lines), style="bright_black"),
             title="Artifacts",
             box=box.ROUNDED,
             border_style="yellow",
+            height=artifact_height,
         )
-        events_panel = Panel(body, title="Recent Events", box=box.ROUNDED, border_style="cyan")
-        return _group_or_columns([artifacts_panel, events_panel], width=self.console.size.width, threshold=140)
+        events_panel = Panel(body, title="Recent Events", box=box.ROUNDED, border_style="cyan", height=events_height)
+        if self.console.size.width >= 140:
+            grid = Table.grid(expand=True)
+            grid.add_column(ratio=1)
+            grid.add_column(ratio=2)
+            grid.add_row(artifacts_panel, events_panel)
+            return grid
+        return Group(artifacts_panel, events_panel)
 
     def _render_logs(self, detail: JobDetail) -> RenderableType:
+        paths = resolve_job_paths(detail.row.job.id)
+        names = list(detail.log_previews)
+        panel_layout = _log_panel_layout(self._detail_fill_height(), names=names)
         panels = []
-        for name, preview in detail.log_previews.items():
-            panels.append(_render_log_panel(name, preview))
+        for name, _preview in detail.log_previews.items():
+            height, lines = panel_layout.get(name, (8, 3))
+            preview = _tail_text(paths.logs_dir / name, lines)
+            panels.append(_render_log_panel(name, preview, height=height, line_count=lines))
         return Group(*panels)
 
     def _render_conversation(self, detail: JobDetail) -> RenderableType:
-        return Panel(detail.conversation_view, title="Conversation", box=box.ROUNDED, border_style="cyan")
+        height = self._detail_fill_height()
+        limit = max((height - 4) * 2, 24)
+        path = resolve_job_paths(detail.row.job.id).logs_dir / "conversation.jsonl"
+        body = _conversation_view_text(path, limit=limit)
+        return Panel(body, title="Conversation", box=box.ROUNDED, border_style="cyan", height=height)
 
     def _render_gpu_summary(self, detail: JobDetail) -> RenderableType:
         job = detail.row.job
@@ -808,20 +939,23 @@ class _DashboardApp:
             text = f"gpu_ids: {', '.join(job.runtime_profile.gpu_ids)}\nwaiting for GPU telemetry."
             return Panel(text, title="GPU", box=box.ROUNDED, border_style="blue")
 
-        panels = []
-        for stat in detail.gpu_stats:
-            grid = Table.grid(expand=True)
-            grid.add_column(style="cyan", ratio=1)
-            grid.add_column(ratio=2)
-            grid.add_row("name", stat.name)
-            grid.add_row("util", Text.assemble(_bar_text(stat.utilization, color="cyan"), Text(f" {stat.utilization or 0}%", style="white")))
-            mem_percent = _memory_percent(stat)
-            grid.add_row("memory", Text.assemble(_bar_text(mem_percent, color="magenta"), Text(f" {_memory_text(stat)}", style="white")))
-            grid.add_row("temp", f"{stat.temperature if stat.temperature is not None else '-'} C")
-            panels.append(
-                Panel(grid, title=f"GPU {stat.index}", box=box.ROUNDED, border_style="blue")
+        uuid_to_processes: dict[str, list[GpuProcess]] = {}
+        for process in detail.gpu_processes:
+            uuid_to_processes.setdefault(process.gpu_uuid, []).append(process)
+
+        sections: list[RenderableType] = []
+        for index, stat in enumerate(detail.gpu_stats):
+            history = detail.gpu_history.get(stat.index, [])
+            processes = sorted(
+                uuid_to_processes.get(stat.uuid, []),
+                key=lambda item: (item.used_gpu_memory or 0, item.pid),
+                reverse=True,
             )
-        return Group(*panels)
+            sections.append(_render_gpu_section(stat, history, processes, process_error=detail.gpu_process_error))
+            if index < len(detail.gpu_stats) - 1:
+                sections.append(Text())
+
+        return Panel(Group(*sections), title="GPU", box=box.ROUNDED, border_style="blue")
 
     def _render_gpu_page(self, snapshot: DashboardSnapshot) -> RenderableType:
         detail = snapshot.detail
@@ -961,15 +1095,15 @@ def _latest_event_summary(job: JobRecord) -> str:
     return ""
 
 
-def _recent_events(job: JobRecord) -> list[dict[str, Any]]:
+def _recent_events(job: JobRecord, *, limit: int = EVENT_LIMIT) -> list[dict[str, Any]]:
     paths = resolve_job_paths(job.id)
-    records = _load_recent_jsonl(paths.logs_dir / "conversation.jsonl", limit=EVENT_LIMIT)
-    events = _select_recent_feed_records(records, limit=EVENT_LIMIT)
+    records = _load_recent_jsonl(paths.logs_dir / "conversation.jsonl", limit=limit)
+    events = _select_recent_feed_records(records, limit=limit)
     if events:
-        return events[-EVENT_LIMIT:]
+        return events[-limit:]
     store = JobStore()
     fallback: list[dict[str, Any]] = []
-    for event in store.list_events(job.id)[-EVENT_LIMIT:]:
+    for event in store.list_events(job.id)[-limit:]:
         fallback.append(
             {
                 "event_type": "store_event",
@@ -1066,13 +1200,17 @@ def _format_event(record: dict[str, Any]) -> str:
     return summary
 
 
-def _render_recent_events(records: list[dict[str, Any]]) -> RenderableType:
+def _render_recent_events(records: list[dict[str, Any]], *, max_items: int | None = None) -> RenderableType:
     if not records:
         return Text("No events recorded yet.", style="dim")
     lines = [_format_recent_event_text(record) for record in records]
     lines = [line for line in lines if line.plain.strip()]
     if not lines:
         return Text("No events recorded yet.", style="dim")
+    if max_items is not None and len(lines) > max_items:
+        if max_items <= 1:
+            return Text("...", style="dim")
+        lines = [Text("...", style="dim"), *lines[-(max_items - 1) :]]
     return Group(*lines)
 
 
@@ -1170,6 +1308,49 @@ def _crop(text: str, width: int) -> str:
     return text[: width - 3] + "..."
 
 
+def _truncate_block_lines(text: str, *, max_lines: int) -> str:
+    if max_lines <= 0:
+        return "..."
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text
+    if max_lines == 1:
+        return "..."
+    return "\n".join([*lines[: max_lines - 1], "..."])
+
+
+def _split_heights(total: int, *, parts: int, min_height: int) -> list[int]:
+    if parts <= 0:
+        return []
+    total = max(total, parts * min_height)
+    base = total // parts
+    remainder = total % parts
+    heights = [base] * parts
+    for index in range(remainder):
+        heights[-(index + 1)] += 1
+    return [max(height, min_height) for height in heights]
+
+
+def _log_panel_layout(total_height: int, *, names: list[str]) -> dict[str, tuple[int, int]]:
+    if not names:
+        return {}
+
+    if "job.log" in names and len(names) > 1:
+        job_height = 9
+        other_names = [name for name in names if name != "job.log"]
+        min_total = job_height + len(other_names) * 6
+        if total_height >= min_total:
+            remaining = total_height - job_height
+            other_heights = _split_heights(remaining, parts=len(other_names), min_height=6)
+            layout = {"job.log": (job_height, 4)}
+            for name, height in zip(other_names, other_heights):
+                layout[name] = (height, max(height - 5, 3))
+            return layout
+
+    heights = _split_heights(total_height, parts=len(names), min_height=6)
+    return {name: (height, max(height - 5, 3)) for name, height in zip(names, heights)}
+
+
 def _string_value(value: Any) -> str | None:
     return value if isinstance(value, str) and value.strip() else None
 
@@ -1193,11 +1374,11 @@ def _bar_text(percent: int | None, *, width: int = 12, color: str = "cyan") -> T
     return text
 
 
-def _render_log_panel(name: str, preview: str) -> Panel:
+def _render_log_panel(name: str, preview: str, *, height: int | None = None, line_count: int = PREVIEW_LINES) -> Panel:
     border_style = "cyan" if name == "job.log" else "magenta"
     body = _render_log_preview_body(preview)
-    subtitle = Text(f"tail {PREVIEW_LINES} lines", style="dim")
-    return Panel(Group(subtitle, Text(), body), title=name, box=box.ROUNDED, border_style=border_style)
+    subtitle = Text(f"tail {line_count} lines", style="dim")
+    return Panel(Group(subtitle, Text(), body), title=name, box=box.ROUNDED, border_style=border_style, height=height)
 
 
 def _render_log_preview_body(preview: str) -> RenderableType:
@@ -1225,6 +1406,111 @@ def _render_log_preview_body(preview: str) -> RenderableType:
     return render
 
 
+def _render_gpu_section(
+    stat: GpuStat,
+    history: list[GpuHistoryPoint],
+    processes: list[GpuProcess],
+    *,
+    process_error: str | None,
+) -> RenderableType:
+    del history
+    mem_percent = _memory_percent(stat)
+    temp_percent = _temperature_percent(stat.temperature)
+
+    header = Table.grid(expand=True)
+    header.add_column(ratio=1)
+    header.add_column(justify="right", ratio=2)
+    header.add_row(
+        Text(f"GPU {stat.index}", style="bold cyan"),
+        Text(stat.name, style="bold bright_white"),
+    )
+
+    metrics = Group(
+        _render_gpu_metric_row("util", stat.utilization, color="cyan", warn=70, critical=90),
+        _render_gpu_metric_row("mem", mem_percent, color="bright_blue", warn=75, critical=90, detail=_memory_compact_text(stat)),
+        _render_gpu_metric_row("temp", temp_percent, color="yellow", warn=70, critical=85, detail=_temperature_text(stat.temperature)),
+    )
+
+    process_body = _render_gpu_processes(processes, process_error=process_error)
+    return Group(header, Text(), metrics, Text(), process_body)
+
+
+def _render_gpu_metric_row(
+    label: str,
+    percent: int | None,
+    *,
+    color: str,
+    warn: int,
+    critical: int,
+    detail: str | None = None,
+) -> RenderableType:
+    level_style = _gpu_metric_style(percent, warn=warn, critical=critical)
+    accent = _gpu_bar_color(color, percent, warn=warn, critical=critical)
+
+    row = Table.grid(expand=True, padding=(0, 1))
+    row.add_column(width=4)
+    row.add_column(justify="right", width=5)
+    row.add_column(width=10)
+    row.add_column(justify="right", ratio=1)
+    row.add_row(
+        Text(label, style=f"bold {color}"),
+        _gpu_percent_text(percent, style=level_style),
+        _bar_text(percent, width=10, color=accent),
+        Text(detail or "", style="dim"),
+    )
+    return row
+
+
+def _render_gpu_processes(processes: list[GpuProcess], *, process_error: str | None) -> RenderableType:
+    if process_error:
+        return Text(f"proc unavailable: {process_error}", style="dim")
+    if not processes:
+        return Text("proc no active compute processes on selected GPU", style="dim")
+
+    grid = Table.grid(expand=True, padding=(0, 1))
+    grid.add_column(style="bright_black", width=5)
+    grid.add_column(style="white", ratio=1)
+    grid.add_column(justify="right", style="magenta", width=9)
+    limit = 3
+    for index, process in enumerate(processes[:limit]):
+        grid.add_row(
+            "proc" if index == 0 else "",
+            f"{_crop(Path(process.process_name).name or process.process_name, 18)} [{process.pid}]",
+            "-" if process.used_gpu_memory is None else f"{process.used_gpu_memory}M",
+        )
+    if len(processes) > limit:
+        grid.add_row("", f"+{len(processes) - limit} more", "")
+    return grid
+
+
+def _gpu_metric_style(value: int | None, *, warn: int, critical: int) -> str:
+    if value is None:
+        return "dim"
+    if value >= critical:
+        return "bold red"
+    if value >= warn:
+        return "yellow"
+    return "green"
+
+
+def _gpu_bar_color(base: str, value: int | None, *, warn: int, critical: int) -> str:
+    if value is None:
+        return "bright_black"
+    if value >= critical:
+        return "red"
+    if value >= warn:
+        return "yellow"
+    return base
+
+
+def _gpu_percent_text(value: int | None, *, style: str) -> Text:
+    if value is None:
+        return Text(" - ", style="dim")
+    return Text(f"{value:>3}%", style=style)
+
+
+
+
 def _memory_percent(stat: GpuStat) -> int | None:
     if stat.memory_used is None or stat.memory_total in {None, 0}:
         return None
@@ -1235,6 +1521,24 @@ def _memory_text(stat: GpuStat) -> str:
     if stat.memory_used is None or stat.memory_total is None:
         return "-"
     return f"{stat.memory_used}/{stat.memory_total} MiB"
+
+
+def _memory_compact_text(stat: GpuStat) -> str:
+    if stat.memory_used is None or stat.memory_total is None:
+        return "-"
+    return f"{stat.memory_used / 1024:.1f}/{stat.memory_total / 1024:.1f}G"
+
+
+def _temperature_percent(value: int | None) -> int | None:
+    if value is None:
+        return None
+    return round(max(0, min(value, GPU_TEMP_MAX)) / GPU_TEMP_MAX * 100)
+
+
+def _temperature_text(value: int | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value}C"
 
 
 def _workspace_tree_text(path: Path, *, depth: int) -> str:
