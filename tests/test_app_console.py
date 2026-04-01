@@ -13,6 +13,7 @@ from aisci_app.presentation import paper_doctor_report, paper_job_summary
 from aisci_app.tui import (
     TUIRunResult,
     _conversation_view_text,
+    _select_recent_feed_records,
     _format_recent_event_text,
     _workspace_tree_text,
     parse_nvidia_smi_csv,
@@ -214,6 +215,20 @@ def test_format_recent_event_text_applies_structured_prefixes() -> None:
     assert any(span.style == "yellow" for span in rendered.spans)
 
 
+def test_recent_feed_prefers_operational_events_over_agent_transcript() -> None:
+    records = [
+        {"event_type": "model_response", "phase": "implement", "text": "I will inspect the implementation details."},
+        {"event_type": "tool_result", "phase": "implement", "tool": "bash", "result_preview": "pytest passed"},
+        {"event_type": "subagent_start", "phase": "validate", "message": "experiment subagent started."},
+    ]
+
+    selected = _select_recent_feed_records(records, limit=10)
+
+    assert len(selected) == 2
+    assert selected[0]["event_type"] == "tool_result"
+    assert selected[1]["event_type"] == "subagent_start"
+
+
 def test_cli_global_env_file_option_loads_api_key(tmp_path: Path, monkeypatch) -> None:
     runner = CliRunner()
     env_file = tmp_path / "paper.env"
@@ -387,7 +402,7 @@ def test_tui_once_renders_jobs(monkeypatch, tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     assert "AiScientist" in result.stdout
-    assert job.id in result.stdout
+    assert job.id[-8:] in result.stdout
     assert "Selected Job" in result.stdout
     assert "Terminal TUI" not in result.stdout
     assert "ai-sci" not in result.stdout

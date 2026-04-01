@@ -29,7 +29,7 @@ from aisci_core.store import JobStore
 
 DEFAULT_REFRESH_SECONDS = 2.0
 GPU_REFRESH_SECONDS = 1.0
-MASCOT_FRAME_SECONDS = 4.0
+MASCOT_FRAME_SECONDS = 2.0
 EVENT_LIMIT = 8
 PREVIEW_LINES = 18
 GPU_QUERY = [
@@ -38,25 +38,83 @@ GPU_QUERY = [
     "--format=csv,noheader,nounits",
 ]
 DETAIL_TABS = ("overview", "events", "logs", "conversation")
-MASCOT_FACE_LOOP = (
-    "○ ◡ ○",
-    "- ﹏ -",
-    "> ◡ <",
-    "◕ ◡ ◕",
-    "× _ ×",
-    "○ ◠ ○",
-    "- ︶ -",
-    "> ◠ <",
-    "◕ ◠ ◕",
-    "× ︵ ×",
-)
-
 STATUS_STYLES = {
     JobStatus.PENDING: "yellow",
     JobStatus.RUNNING: "cyan",
     JobStatus.SUCCEEDED: "green",
     JobStatus.FAILED: "bold red",
     JobStatus.CANCELLED: "magenta",
+}
+
+PHASE_LABELS = {
+    "ingest": "ingest",
+    "analyze": "analyze",
+    "prioritize": "prioritize",
+    "implement": "implement",
+    "validate": "validate",
+    "finalize": "finalize",
+}
+
+PHASE_STYLES = {
+    "ingest": "bright_black",
+    "analyze": "yellow",
+    "prioritize": "magenta",
+    "implement": "cyan",
+    "validate": "green",
+    "finalize": "bright_white",
+}
+
+MASCOT_CLASSIC_FACES = (
+    "○ ◡ ○",
+    "- ﹏ -",
+    "> ◡ <",
+    "◕ ◡ ◕",
+    "○ ◠ ○",
+    "- ︶ -",
+    "> ◠ <",
+    "◕ ◠ ◕",
+)
+
+MASCOT_FACES = {
+    "idle": MASCOT_CLASSIC_FACES,
+    "thinking": (
+        "◔ ◡ ◔",
+        "◔ ◠ ◔",
+        "◕ ﹏ ◕",
+        "○ ◠ ○",
+        "- ﹏ -",
+        "> ◡ <",
+        "◕ ◡ ◕",
+        "○ ◡ ○",
+    ),
+    "running": (
+        "◉ ◡ ◉",
+        "◉ ◠ ◉",
+        "> ◡ <",
+        "> ◠ <",
+        "◕ ◡ ◕",
+        "○ ◡ ○",
+        "- ︶ -",
+        "◕ ◠ ◕",
+    ),
+    "success": (
+        "● ◡ ●",
+        "● ◠ ●",
+        "^ ◡ ^",
+        "^ ◠ ^",
+        "○ ◡ ○",
+        "> ◡ <",
+        "◕ ◡ ◕",
+        "- ︶ -",
+    ),
+    "error": (
+        "× _ ×",
+        "× ︵ ×",
+        "x _ x",
+        "x ︵ x",
+        "- ﹏ -",
+        "○ ◠ ○",
+    ),
 }
 
 MASCOT_FRAMES: dict[str, list[list[str]]] = {
@@ -457,7 +515,7 @@ class _DashboardApp:
                 "agent.log": _tail_text(paths.logs_dir / "agent.log", PREVIEW_LINES),
             },
             artifact_lines=artifact_lines,
-            artifact_tree=_workspace_tree_text(paths.workspace_dir, depth=2),
+            artifact_tree=_workspace_tree_text(paths.workspace_dir, depth=3),
             conversation_view=_conversation_view_text(paths.logs_dir / "conversation.jsonl", limit=24),
             gpu_stats=selected_gpu_stats,
             gpu_error=gpu_error,
@@ -525,7 +583,7 @@ class _DashboardApp:
     def _render(self, snapshot: DashboardSnapshot) -> RenderableType:
         layout = Layout()
         layout.split_column(
-            Layout(self._render_header(snapshot), name="header", size=4),
+            Layout(self._render_header(snapshot), name="header", size=5),
             Layout(name="body"),
             Layout(self._render_footer(snapshot), name="footer", size=2),
         )
@@ -552,20 +610,23 @@ class _DashboardApp:
 
     def _render_header(self, snapshot: DashboardSnapshot) -> RenderableType:
         selected = snapshot.selected
-        title = Text("AiScientist", style="bold cyan")
+        title = Text("AiScientist", style="bold bright_white")
         title.append("  ")
         title.append(self._render_mascot(selected.job if selected else None, phase_override=selected.display_phase if selected else None))
+
         subtitle = Text()
         subtitle.append(f"jobs={len(snapshot.jobs)}", style="white")
         if selected:
             subtitle.append("  ")
-            subtitle.append(f"selected={selected.job.id}", style="cyan")
+            subtitle.append(f"job={_short_job_id(selected.job.id, width=20)}", style="cyan")
             subtitle.append("  ")
-            subtitle.append(f"status={selected.job.status.value}", style=STATUS_STYLES[selected.job.status])
+            subtitle.append_text(_status_badge(selected.job.status))
+            subtitle.append("  ")
+            subtitle.append(_labelize_phase(selected.display_phase), style=PHASE_STYLES.get(selected.display_phase, "white"))
         if self.message:
             subtitle.append("  ")
             subtitle.append(self.message, style="yellow")
-        return Panel(Group(title, subtitle), box=box.ROUNDED)
+        return Panel(Group(title, subtitle), box=box.ROUNDED, border_style="cyan")
 
     def _render_footer(self, snapshot: DashboardSnapshot) -> RenderableType:
         hints = "j/k move  enter details  b back  1-4 tabs  g gpu  r refresh  q quit"
@@ -573,36 +634,36 @@ class _DashboardApp:
             hints = "b back  r refresh  q quit"
         if not snapshot.jobs:
             hints = "q quit"
-        return Panel(Text(hints, style="dim"), box=box.SQUARE)
+        return Panel(Text(hints, style="dim"), box=box.SQUARE, border_style="bright_black")
 
     def _render_jobs_page(self, snapshot: DashboardSnapshot) -> RenderableType:
         if not snapshot.jobs:
-            return Panel("No jobs found. Start one with `aisci paper run --wait --tui`.", box=box.ROUNDED)
+            return Panel("No jobs found. Start one with `aisci paper run --wait --tui`.", box=box.ROUNDED, border_style="bright_black")
 
-        table = Table(box=box.SIMPLE_HEAVY, expand=True, show_lines=False)
+        table = Table(box=box.SIMPLE_HEAVY, expand=True, show_lines=False, header_style="bold bright_white", row_styles=["", "dim"])
         table.add_column("", width=2)
         table.add_column("Job", style="cyan", no_wrap=True)
         table.add_column("Type", width=6)
-        table.add_column("Status", width=10)
+        table.add_column("Status", width=12, no_wrap=True)
         table.add_column("Phase", width=11)
         table.add_column("Age", width=10)
         table.add_column("GPU", width=12)
         table.add_column("Checks", width=24)
         table.add_column("Latest Event", overflow="fold")
         for index, row in enumerate(snapshot.jobs):
-            marker = ">" if index == snapshot.selected_index else " "
+            selected = index == snapshot.selected_index
             checks = _checks_status(row.validation_status, row.self_check_status)
             table.add_row(
-                marker,
+                Text(">" if selected else " ", style="bold cyan" if selected else "dim"),
                 row.job.id,
                 row.job.job_type.value,
-                Text(row.job.status.value, style=STATUS_STYLES[row.job.status]),
-                row.display_phase,
-                _human_duration(row.job.duration_seconds),
+                _status_badge(row.job.status),
+                Text(_labelize_phase(row.display_phase), style=PHASE_STYLES.get(row.display_phase, "white")),
+                Text(_human_duration(row.job.duration_seconds), style="white"),
                 row.gpu_binding,
                 checks,
-                _crop(row.latest_event, 80),
-                style="bold" if index == snapshot.selected_index else "",
+                Text(_crop(row.latest_event, 80), style="white"),
+                style="bold" if selected else "",
             )
 
         right = []
@@ -612,35 +673,37 @@ class _DashboardApp:
         if self.console.size.width >= 120 and right:
             return Columns(
                 [
-                    Panel(table, title="Jobs", box=box.ROUNDED),
+                    Panel(table, title="Jobs", box=box.ROUNDED, border_style="cyan"),
                     Group(*right),
                 ],
                 expand=True,
                 equal=False,
             )
-        return Group(Panel(table, title="Jobs", box=box.ROUNDED), *right)
+        return Group(Panel(table, title="Jobs", box=box.ROUNDED, border_style="cyan"), *right)
 
     def _render_selected_summary(self, detail: JobDetail) -> RenderableType:
         job = detail.row.job
-        lines = [
-            f"objective: {job.objective}",
-            f"status: {job.status.value}",
-            f"phase: {detail.row.display_phase}",
-            f"latest activity: {_crop(detail.row.latest_event, 180)}",
-            f"mode: {_job_mode(job)}",
-        ]
+        summary = Table.grid(expand=True)
+        summary.add_column(style="cyan", ratio=1)
+        summary.add_column(ratio=2)
+        summary.add_row("objective", _crop(job.objective, 120))
+        summary.add_row("status", _status_badge(job.status))
+        summary.add_row("phase", Text(_labelize_phase(detail.row.display_phase), style=PHASE_STYLES.get(detail.row.display_phase, "white")))
+        summary.add_row("checks", _checks_status(detail.row.validation_status, detail.row.self_check_status))
+        summary.add_row("latest", _crop(detail.row.latest_event, 180))
+        summary.add_row("mode", _job_mode(job))
         if detail.main_step is not None:
-            lines.append(f"orchestrator step: {detail.main_step}")
+            summary.add_row("orchestrator step", str(detail.main_step))
         if job.runtime_profile.gpu_ids:
-            lines.append(f"gpu_ids: {', '.join(job.runtime_profile.gpu_ids)}")
+            summary.add_row("gpu_ids", ", ".join(job.runtime_profile.gpu_ids))
         elif job.runtime_profile.gpu_count > 0:
-            lines.append(f"gpu_count: {job.runtime_profile.gpu_count}")
-        return Panel("\n".join(lines), title="Selected Job", box=box.ROUNDED)
+            summary.add_row("gpu_count", str(job.runtime_profile.gpu_count))
+        return Panel(summary, title="Selected Job", box=box.ROUNDED, border_style=_status_style(job.status.value))
 
     def _render_detail_page(self, snapshot: DashboardSnapshot) -> RenderableType:
         detail = snapshot.detail
         if detail is None:
-            return Panel("Job not found.", box=box.ROUNDED)
+            return Panel("Job not found.", box=box.ROUNDED, border_style="red")
 
         main = self._render_detail_main(detail)
         sidebar = self._render_detail_sidebar(detail)
@@ -666,7 +729,7 @@ class _DashboardApp:
         else:
             body = self._render_conversation(detail)
         return Group(
-            Panel(tab_line, title=f"Job {detail.row.job.id}", box=box.ROUNDED),
+            Panel(tab_line, title=f"Job {detail.row.job.id}", box=box.ROUNDED, border_style="cyan"),
             body,
         )
 
@@ -681,12 +744,12 @@ class _DashboardApp:
         overview = Table.grid(expand=True)
         overview.add_column(style="cyan", ratio=1)
         overview.add_column(ratio=2)
-        overview.add_row("mode", _job_mode(job))
-        overview.add_row("status", Text(job.status.value, style=STATUS_STYLES[job.status]))
+        overview.add_row("status", _status_badge(job.status))
+        overview.add_row("phase", Text(_labelize_phase(detail.row.display_phase), style=PHASE_STYLES.get(detail.row.display_phase, "white")))
         overview.add_row("llm", job.llm_profile)
         overview.add_row("gpu", detail.row.gpu_binding)
-        overview.add_row("phase", detail.row.display_phase)
-        overview.add_row("duration", _human_duration(job.duration_seconds))
+        overview.add_row("mode", _job_mode(job))
+        overview.add_row("duration", Text(_human_duration(job.duration_seconds), style="white"))
         overview.add_row("orchestrator step", str(detail.main_step or "-"))
         overview.add_row("latest activity", _crop(detail.row.latest_event, 120))
         subagents = Table.grid(expand=True)
@@ -703,26 +766,30 @@ class _DashboardApp:
         runtime.add_row("image", _string_value(detail.sandbox.get("image_ref")) or _string_value(job.runtime_profile.image) or "-")
         runtime.add_row("container", _string_value(detail.sandbox.get("container_name")) or "-")
         return Group(
-            Panel(overview, title="Overview", box=box.ROUNDED),
-            Panel(subagents, title="Subagent Calls", box=box.ROUNDED),
-            Panel(runtime, title="Runtime", box=box.ROUNDED),
+            Panel(overview, title="Overview", box=box.ROUNDED, border_style="cyan"),
+            Panel(subagents, title="Subagent Calls", box=box.ROUNDED, border_style="magenta"),
+            Panel(runtime, title="Runtime", box=box.ROUNDED, border_style="yellow"),
         )
 
     def _render_events(self, detail: JobDetail) -> RenderableType:
         body = _render_recent_events(detail.recent_events)
-        return Group(
-            Panel(detail.artifact_tree, title="Artifacts", box=box.ROUNDED),
-            Panel(body, title="Recent Events", box=box.ROUNDED),
+        artifacts_panel = Panel(
+            Text(detail.artifact_tree, style="bright_black"),
+            title="Artifacts",
+            box=box.ROUNDED,
+            border_style="yellow",
         )
+        events_panel = Panel(body, title="Recent Events", box=box.ROUNDED, border_style="cyan")
+        return _group_or_columns([artifacts_panel, events_panel], width=self.console.size.width, threshold=140)
 
     def _render_logs(self, detail: JobDetail) -> RenderableType:
         panels = []
         for name, preview in detail.log_previews.items():
-            panels.append(Panel(preview or "(empty)", title=name, box=box.ROUNDED))
+            panels.append(_render_log_panel(name, preview))
         return Group(*panels)
 
     def _render_conversation(self, detail: JobDetail) -> RenderableType:
-        return Panel(detail.conversation_view, title="Conversation", box=box.ROUNDED)
+        return Panel(detail.conversation_view, title="Conversation", box=box.ROUNDED, border_style="cyan")
 
     def _render_gpu_summary(self, detail: JobDetail) -> RenderableType:
         job = detail.row.job
@@ -731,50 +798,57 @@ class _DashboardApp:
                 text = f"Requested {job.runtime_profile.gpu_count} GPU(s).\nUse --gpu-ids for per-device telemetry."
             else:
                 text = "No GPU binding recorded for this job."
-            return Panel(text, title="GPU", box=box.ROUNDED)
+            return Panel(text, title="GPU", box=box.ROUNDED, border_style="blue")
 
         if detail.gpu_error:
             text = f"gpu_ids: {', '.join(job.runtime_profile.gpu_ids)}\ntelemetry unavailable: {detail.gpu_error}"
-            return Panel(text, title="GPU", box=box.ROUNDED)
+            return Panel(text, title="GPU", box=box.ROUNDED, border_style="red")
 
         if not detail.gpu_stats:
             text = f"gpu_ids: {', '.join(job.runtime_profile.gpu_ids)}\nwaiting for GPU telemetry."
-            return Panel(text, title="GPU", box=box.ROUNDED)
+            return Panel(text, title="GPU", box=box.ROUNDED, border_style="blue")
 
-        parts = []
+        panels = []
         for stat in detail.gpu_stats:
-            util = _bar(stat.utilization)
+            grid = Table.grid(expand=True)
+            grid.add_column(style="cyan", ratio=1)
+            grid.add_column(ratio=2)
+            grid.add_row("name", stat.name)
+            grid.add_row("util", Text.assemble(_bar_text(stat.utilization, color="cyan"), Text(f" {stat.utilization or 0}%", style="white")))
             mem_percent = _memory_percent(stat)
-            mem_bar = _bar(mem_percent)
-            parts.append(
-                "\n".join(
-                    [
-                        f"GPU {stat.index}: {stat.name}",
-                        f"util {util} {stat.utilization or 0}%",
-                        f"mem  {mem_bar} {_memory_text(stat)}",
-                        f"temp {stat.temperature if stat.temperature is not None else '-'} C",
-                    ]
-                )
+            grid.add_row("memory", Text.assemble(_bar_text(mem_percent, color="magenta"), Text(f" {_memory_text(stat)}", style="white")))
+            grid.add_row("temp", f"{stat.temperature if stat.temperature is not None else '-'} C")
+            panels.append(
+                Panel(grid, title=f"GPU {stat.index}", box=box.ROUNDED, border_style="blue")
             )
-        return Panel("\n\n".join(parts), title="GPU", box=box.ROUNDED)
+        return Group(*panels)
 
     def _render_gpu_page(self, snapshot: DashboardSnapshot) -> RenderableType:
         detail = snapshot.detail
         if detail is None:
-            return Panel("Job not found.", box=box.ROUNDED)
+            return Panel("Job not found.", box=box.ROUNDED, border_style="red")
         return Group(
             Panel(
                 f"job: {detail.row.job.id}\nstatus: {detail.row.job.status.value}\ngpu: {detail.row.gpu_binding}",
                 title="GPU Scope",
                 box=box.ROUNDED,
+                border_style="cyan",
             ),
             self._render_gpu_summary(detail),
         )
 
     def _render_mascot(self, job: JobRecord | None, *, phase_override: str | None = None) -> Text:
-        _ = job, phase_override
-        frame_index = int(time.monotonic() / MASCOT_FRAME_SECONDS) % len(MASCOT_FACE_LOOP)
-        return Text(_compact_face(frame_index), style="bright_white")
+        phase = _mascot_phase(job, phase_override=phase_override)
+        faces = MASCOT_FACES.get(phase, MASCOT_FACES["idle"])
+        frame_index = int(time.monotonic() / MASCOT_FRAME_SECONDS) % len(faces)
+        style = {
+            "idle": "bright_white",
+            "thinking": "yellow",
+            "running": "cyan",
+            "success": "green",
+            "error": "bold red",
+        }.get(phase, "bright_white")
+        return Text(faces[frame_index], style=style)
 
 
 class _TerminalKeys:
@@ -890,7 +964,7 @@ def _latest_event_summary(job: JobRecord) -> str:
 def _recent_events(job: JobRecord) -> list[dict[str, Any]]:
     paths = resolve_job_paths(job.id)
     records = _load_recent_jsonl(paths.logs_dir / "conversation.jsonl", limit=EVENT_LIMIT)
-    events = [record for record in records if _format_event(record)]
+    events = _select_recent_feed_records(records, limit=EVENT_LIMIT)
     if events:
         return events[-EVENT_LIMIT:]
     store = JobStore()
@@ -904,6 +978,34 @@ def _recent_events(job: JobRecord) -> list[dict[str, Any]]:
             }
         )
     return fallback
+
+
+def _select_recent_feed_records(records: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+    feed = [record for record in records if _event_belongs_in_recent_feed(record)]
+    if feed:
+        return feed[-limit:]
+    return [record for record in records if _format_event(record)][-limit:]
+
+
+def _event_belongs_in_recent_feed(record: dict[str, Any]) -> bool:
+    event_kind = _string_value(record.get("event_type")) or _string_value(record.get("event")) or ""
+    if event_kind in {
+        "tool_result",
+        "subagent_start",
+        "subagent_finish",
+        "status",
+        "validation",
+        "artifact",
+        "error",
+        "store_event",
+    }:
+        return True
+    if event_kind == "model_response":
+        tool_calls = record.get("tool_calls")
+        return isinstance(tool_calls, list) and bool(tool_calls)
+    message = _string_value(record.get("message")) or ""
+    lowered = message.lower()
+    return any(token in lowered for token in ("started", "finished", "completed", "failed", "timeout"))
 
 
 def _latest_step(path: Path) -> int | None:
@@ -1039,13 +1141,19 @@ def _checks_status(validation_status: str | None, self_check_status: str | None)
 
 
 def _status_text_style(status: str | None) -> str:
-    if status == "passed" or status == "succeeded":
-        return "green"
-    if status == "failed":
-        return "bold red"
-    if status == "skipped":
-        return "yellow"
-    return "white"
+    return _status_style(status)
+
+
+def _group_or_columns(
+    renderables: list[RenderableType],
+    *,
+    width: int,
+    threshold: int,
+    equal: bool = False,
+) -> RenderableType:
+    if width >= threshold:
+        return Columns(renderables, expand=True, equal=equal)
+    return Group(*renderables)
 
 
 def _compact_text(text: str | None) -> str:
@@ -1072,6 +1180,49 @@ def _bar(percent: int | None, *, width: int = 12) -> str:
     percent = max(0, min(percent, 100))
     filled = round(width * percent / 100)
     return "#" * filled + "." * (width - filled)
+
+
+def _bar_text(percent: int | None, *, width: int = 12, color: str = "cyan") -> Text:
+    if percent is None:
+        return Text("░" * width, style="bright_black")
+    percent = max(0, min(percent, 100))
+    filled = round(width * percent / 100)
+    text = Text()
+    text.append("█" * filled, style=color)
+    text.append("░" * (width - filled), style="bright_black")
+    return text
+
+
+def _render_log_panel(name: str, preview: str) -> Panel:
+    border_style = "cyan" if name == "job.log" else "magenta"
+    body = _render_log_preview_body(preview)
+    subtitle = Text(f"tail {PREVIEW_LINES} lines", style="dim")
+    return Panel(Group(subtitle, Text(), body), title=name, box=box.ROUNDED, border_style=border_style)
+
+
+def _render_log_preview_body(preview: str) -> RenderableType:
+    if not preview:
+        return Text("(empty)", style="dim")
+    lines = preview.splitlines()
+    if not lines:
+        return Text("(empty)", style="dim")
+    render = Text()
+    width = max(len(str(len(lines))), 2)
+    for index, line in enumerate(lines, start=1):
+        render.append(str(index).rjust(width), style="bright_black")
+        render.append(" │ ", style="bright_black")
+        style = "bright_white"
+        lowered = line.lower()
+        if "error" in lowered or "traceback" in lowered or "failed" in lowered:
+            style = "red"
+        elif "warning" in lowered or "warn" in lowered:
+            style = "yellow"
+        elif "success" in lowered or "passed" in lowered or "completed" in lowered:
+            style = "green"
+        render.append(line or " ", style=style)
+        if index < len(lines):
+            render.append("\n")
+    return render
 
 
 def _memory_percent(stat: GpuStat) -> int | None:
@@ -1244,6 +1395,12 @@ def _labelize_subagent(name: str) -> str:
     return name.replace("_", " ")
 
 
+def _labelize_phase(name: str | None) -> str:
+    if not name:
+        return "-"
+    return PHASE_LABELS.get(name, name)
+
+
 def _job_mode(job: JobRecord) -> str:
     if job.runtime_profile.workspace_layout:
         return job.runtime_profile.workspace_layout.value
@@ -1266,4 +1423,50 @@ def _mascot_phase(job: JobRecord | None, *, phase_override: str | None = None) -
 
 
 def _compact_face(frame_index: int) -> str:
-    return MASCOT_FACE_LOOP[frame_index % len(MASCOT_FACE_LOOP)]
+    _ = frame_index
+    return "○ ◡ ○"
+
+
+def _short_job_id(job_id: str, *, width: int = 22) -> str:
+    if len(job_id) <= width:
+        return job_id
+    edge = max((width - 3) // 2, 6)
+    return f"{job_id[:edge]}...{job_id[-edge:]}"
+
+
+def _status_style(status: str | None) -> str:
+    normalized = (status or "").strip().lower()
+    if normalized in {"passed", "succeeded", JobStatus.SUCCEEDED.value, "ok", "available", "enabled"}:
+        return "green"
+    if normalized in {"failed", "fail", JobStatus.FAILED.value}:
+        return "bold red"
+    if normalized in {"pending", JobStatus.PENDING.value}:
+        return "yellow"
+    if normalized in {"running", JobStatus.RUNNING.value}:
+        return "cyan"
+    if normalized in {"cancelled", JobStatus.CANCELLED.value}:
+        return "magenta"
+    if normalized in {"skipped", "warn", "warning"}:
+        return "yellow"
+    return "white"
+
+
+def _status_badge(status: JobStatus | str | None) -> Text:
+    label = status.value if isinstance(status, JobStatus) else (status or "-")
+    normalized = label.strip().lower()
+    icon = {
+        "passed": "●",
+        "succeeded": "●",
+        JobStatus.SUCCEEDED.value: "●",
+        "failed": "✕",
+        "fail": "✕",
+        JobStatus.FAILED.value: "✕",
+        "running": "◉",
+        JobStatus.RUNNING.value: "◉",
+        "pending": "◌",
+        JobStatus.PENDING.value: "◌",
+        "cancelled": "◌",
+        JobStatus.CANCELLED.value: "◌",
+        "skipped": "△",
+    }.get(normalized, "•")
+    return Text(f"{icon} {label}", style=_status_style(label))
