@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ENV_FILE=/home/chenjie.survivi/aisci-0331/dev-AiSci/test/aisci_mle_glm5.env
-OUTPUT_ROOT=/home/chenjie.survivi/aisci-0331/dev-AiSci/test/output
+ENV_FILE=/data03/chenguoxin.cgx/wksp/ai_workspace/dev/case/.env
+OUTPUT_ROOT=/data03/chenguoxin.cgx/wksp/ai_workspace/output_dir/cli
 COMPETITION_NAME=detecting-insults-in-social-commentary
-COMPETITION_ZIP=/home/chenjie.survivi/aisci-0331/dev-AiSci/data/detecting-insults-in-social-commentary.zip
+COMPETITION_ZIP=/data03/chenguoxin.cgx/wksp/ai_workspace/dev/case/mle/detecting-insults-in-social-commentary.zip
 LLM_PROFILE=glm-5
-GPU_IDS=0
+GPU_IDS=5
 TIME_LIMIT="12h"
 IMAGE=aisci-mle:test
 
@@ -21,9 +21,8 @@ uv run aisci \
   --name "${COMPETITION_NAME}" \
   --zip "${COMPETITION_ZIP}" \
   --image "${IMAGE}" \
-  --pull-policy never \
   --llm-profile "${LLM_PROFILE}" \
   --gpu-ids "${GPU_IDS}" \
   --time-limit "${TIME_LIMIT}" \
-  --run-final-validation \
+  --tui \
   --wait

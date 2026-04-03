@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import sqlite3
 from contextlib import contextmanager
@@ -20,6 +21,9 @@ from aisci_core.models import (
     MLESpec,
 )
 from aisci_core.paths import database_path
+
+
+STALE_WORKER_ERROR = "worker exited unexpectedly before final status update"
 
 
 def _to_iso(value: datetime | None) -> str | None:
@@ -122,16 +126,25 @@ class JobStore:
         return self.get_job(job_id)
 
     def get_job(self, job_id: str) -> JobRecord:
-        with self.connect() as conn:
-            row = conn.execute("select * from jobs where id = ?", (job_id,)).fetchone()
+        row = self._fetch_job_row(job_id)
         if row is None:
             raise KeyError(f"unknown job {job_id}")
-        return self._row_to_job(row)
+        job = self._row_to_job(row)
+        if self._reconcile_running_job(job):
+            refreshed = self._fetch_job_row(job_id)
+            if refreshed is None:
+                raise KeyError(f"unknown job {job_id}")
+            job = self._row_to_job(refreshed)
+        return job
 
     def list_jobs(self) -> list[JobRecord]:
-        with self.connect() as conn:
-            rows = conn.execute("select * from jobs order by created_at desc").fetchall()
-        return [self._row_to_job(row) for row in rows]
+        jobs = [self._row_to_job(row) for row in self._fetch_job_rows()]
+        reconciled = False
+        for job in jobs:
+            reconciled = self._reconcile_running_job(job) or reconciled
+        if reconciled:
+            jobs = [self._row_to_job(row) for row in self._fetch_job_rows()]
+        return jobs
 
     def append_event(
         self,
@@ -254,6 +267,74 @@ class JobStore:
                 where id = ?
                 """,
                 (status.value, now, now, error, job_id),
+            )
+
+    def _fetch_job_row(self, job_id: str) -> sqlite3.Row | None:
+        with self.connect() as conn:
+            return conn.execute("select * from jobs where id = ?", (job_id,)).fetchone()
+
+    def _fetch_job_rows(self) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute("select * from jobs order by created_at desc").fetchall()
+
+    def _reconcile_running_job(self, job: JobRecord) -> bool:
+        if job.status != JobStatus.RUNNING or job.worker_pid is None:
+            return False
+        if self._pid_exists(job.worker_pid):
+            return False
+        self._mark_job_stale(job)
+        return True
+
+    def _pid_exists(self, pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    def _mark_job_stale(self, job: JobRecord) -> None:
+        now = datetime.now().astimezone()
+        payload = {
+            "reconciled": True,
+            "reason": "stale_worker",
+            "worker_pid": job.worker_pid,
+            "status": JobStatus.FAILED.value,
+        }
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                update jobs
+                set status = ?, updated_at = ?, ended_at = ?, error = ?
+                where id = ? and status = ?
+                """,
+                (
+                    JobStatus.FAILED.value,
+                    now.isoformat(),
+                    now.isoformat(),
+                    STALE_WORKER_ERROR,
+                    job.id,
+                    JobStatus.RUNNING.value,
+                ),
+            )
+            if cursor.rowcount == 0:
+                return
+            conn.execute(
+                """
+                insert into events (job_id, event_type, phase, message, payload_json, created_at)
+                values (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job.id,
+                    "status",
+                    job.phase.value,
+                    "Worker exited unexpectedly before final status update.",
+                    json.dumps(payload, ensure_ascii=True),
+                    now.isoformat(),
+                ),
             )
 
     def _row_to_job(self, row: sqlite3.Row) -> JobRecord:

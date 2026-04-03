@@ -267,10 +267,9 @@ class MLEDomainAdapter:
         )
         if bundle_path:
             resolved_bundle_path = Path(bundle_path).resolve()
-            competition_name = self._competition_name_from_bundle(resolved_bundle_path)
-            with self._prepare_local_zip_source(
+            with self._resolve_bundle_public_source(
                 resolved_bundle_path,
-                competition_name=competition_name,
+                spec=spec,
             ) as source:
                 yield source
             return
@@ -402,6 +401,64 @@ class MLEDomainAdapter:
                 cache_root=cache_root,
                 prepared_dir=prepared_dir,
             )
+
+    @contextmanager
+    def _resolve_bundle_public_source(
+        self,
+        bundle_path: Path,
+        *,
+        spec: MLESpec,
+    ):
+        with tempfile.TemporaryDirectory(prefix="aisci-mle-bundle-", dir="/tmp") as temp_dir:
+            staging_root = Path(temp_dir).resolve()
+            extracted_root = staging_root / "bundle"
+            extracted_root.mkdir(parents=True, exist_ok=True)
+            self._extract_zip(bundle_path, extracted_root)
+            effective_root = self._unwrap_single_directory(extracted_root)
+
+            direct_source = self._bundle_direct_public_source(effective_root, spec=spec)
+            if direct_source is not None:
+                yield direct_source
+                return
+
+        competition_name = self._competition_name_from_bundle(bundle_path)
+        with self._prepare_local_zip_source(
+            bundle_path,
+            competition_name=competition_name,
+        ) as source:
+            yield source
+
+    def _bundle_direct_public_source(self, root: Path, *, spec: MLESpec) -> PreparedPublicSource | None:
+        structured_source = self._try_resolve_safe_data_dir(root)
+        if structured_source is not None:
+            try:
+                self._assert_public_data_safe(structured_source.public_dir)
+            except ValueError:
+                structured_source = None
+            else:
+                if self._bundle_has_public_metadata(structured_source.public_dir, spec=spec):
+                    return structured_source
+
+        try:
+            self._assert_public_data_safe(root)
+        except ValueError:
+            return None
+        if self._bundle_has_public_metadata(root, spec=spec):
+            return PreparedPublicSource(public_dir=root)
+        return None
+
+    def _bundle_has_public_metadata(self, root: Path, *, spec: MLESpec) -> bool:
+        return (
+            (root / "description.md").is_file() or bool(spec.description_path)
+        ) and (
+            (root / "sample_submission.csv").is_file() or bool(spec.sample_submission_path)
+        )
+
+    def _try_resolve_safe_data_dir(self, source: Path) -> PreparedPublicSource | None:
+        try:
+            return self._resolve_safe_data_dir(source)
+        except ValueError:
+            return None
 
     def _mlebench_cache_root(self, spec: MLESpec) -> Path:
         configured = getattr(spec, "mlebench_data_dir", None)
@@ -849,6 +906,15 @@ class MLEDomainAdapter:
         )
         if bundle_path:
             resolved_bundle_path = Path(bundle_path).resolve()
+            with tempfile.TemporaryDirectory(prefix="aisci-mle-validate-bundle-", dir="/tmp") as temp_dir:
+                staging_root = Path(temp_dir).resolve()
+                extracted_root = staging_root / "bundle"
+                extracted_root.mkdir(parents=True, exist_ok=True)
+                self._extract_zip(resolved_bundle_path, extracted_root)
+                effective_root = self._unwrap_single_directory(extracted_root)
+                if self._bundle_direct_public_source(effective_root, spec=spec) is not None:
+                    yield None
+                    return
             competition_name = self._competition_name_from_bundle(resolved_bundle_path)
             with self._prepare_local_validation_cache(
                 resolved_bundle_path,

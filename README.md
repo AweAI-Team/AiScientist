@@ -40,6 +40,7 @@ Sandbox runtime image selection is also driven by a YAML registry.
 The default registry lives at `config/image_profiles.yaml` in the repo root.
 If you want to maintain your own image profile set, point `AISCI_IMAGE_PROFILE_FILE` at a custom YAML file.
 The checked-in default `paper` profile assumes a locally prebuilt `aisci-paper:latest` image.
+The local MLE build helper currently produces `aisci-mle:test`.
 
 You can also point to a custom file explicitly:
 

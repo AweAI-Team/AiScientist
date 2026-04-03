@@ -4,7 +4,7 @@ import json
 import re
 from pathlib import Path
 
-from aisci_core.models import JobSpec, JobType, MLESpec, PaperSpec, RuntimeProfile, RunPhase
+from aisci_core.models import JobSpec, JobStatus, JobType, MLESpec, PaperSpec, RuntimeProfile, RunPhase
 from aisci_core.paths import database_path, ensure_job_dirs, jobs_root, repo_root, resolve_job_paths, state_root, var_root
 from aisci_core.runner import JobRunner
 from aisci_core.store import JobStore
@@ -92,3 +92,31 @@ def test_output_root_can_be_separated_from_repo_root(tmp_path: Path, monkeypatch
     assert jobs_root() == output.resolve() / "jobs"
     assert state_root() == output.resolve() / ".aisci"
     assert database_path() == output.resolve() / ".aisci" / "state" / "jobs.db"
+
+
+def test_store_reconciles_stale_running_jobs(tmp_path: Path, monkeypatch) -> None:
+    store = JobStore(tmp_path / "jobs.db")
+    job = store.create_job(
+        JobSpec(
+            job_type=JobType.PAPER,
+            objective="paper test",
+            llm_profile="paper-default",
+            runtime_profile=RuntimeProfile(),
+            mode_spec=PaperSpec(pdf_path="/tmp/paper.pdf"),
+        )
+    )
+    store.mark_running(job.id, 424242)
+    monkeypatch.setattr(
+        "aisci_core.store.os.kill",
+        lambda pid, sig: (_ for _ in ()).throw(ProcessLookupError()) if pid == 424242 else None,
+    )
+
+    reconciled = store.get_job(job.id)
+
+    assert reconciled.status == JobStatus.FAILED
+    assert reconciled.error == "worker exited unexpectedly before final status update"
+    events = store.list_events(job.id)
+    stale_events = [event for event in events if event.payload.get("reason") == "stale_worker"]
+    assert len(stale_events) == 1
+    assert stale_events[0].payload["worker_pid"] == 424242
+    assert store.list_jobs()[0].status == JobStatus.FAILED

@@ -403,59 +403,43 @@ class DataVisibilityAdapterTests(unittest.TestCase):
                 self.assertTrue((target.prepared_dir / "public" / "train.csv").is_file())
                 self.assertFalse(str(target.prepared_dir).startswith(str(tmp_path / "job" / "workspace")))
 
-    def test_run_real_loop_wraps_orchestrator_with_timeout_and_restores_submission(self) -> None:
+    def test_run_real_loop_restores_submission_and_materializes_registry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
-            runtime = SimpleNamespace()
-            exec_calls: list[dict[str, object]] = []
+            runtime = mock.Mock()
+            runtime.prepare_image.return_value = "aisci-mle:test"
+            runtime.create_session_spec.return_value = SimpleNamespace(
+                profile=SimpleNamespace(name="mle-default", pull_policy=SimpleNamespace(value="if-missing")),
+                runtime_profile=SimpleNamespace(pull_policy=None),
+                workdir="/home/code",
+                env=(),
+                mounts=(),
+                labels=(),
+                run_as_user="1000:1000",
+                workspace_layout=SimpleNamespace(value="mle"),
+            )
+            runtime.start_session.return_value = SimpleNamespace(
+                container_name="mle-test-session",
+                image_tag="aisci-mle:test",
+                profile=runtime.create_session_spec.return_value.profile,
+                runtime_profile=runtime.create_session_spec.return_value.runtime_profile,
+                workspace_layout=runtime.create_session_spec.return_value.workspace_layout,
+                mounts=runtime.create_session_spec.return_value.mounts,
+                workdir=runtime.create_session_spec.return_value.workdir,
+                labels=runtime.create_session_spec.return_value.labels,
+                run_as_user=runtime.create_session_spec.return_value.run_as_user,
+                started_at=SimpleNamespace(isoformat=lambda: "2026-04-01T00:00:00+00:00"),
+            )
+            runtime.inspect_session.return_value = {}
 
-            def prepare_image(profile, runtime_profile):  # noqa: ANN001,ARG001
-                return "aisci-mle:test"
-
-            def create_session_spec(job_id, job_paths, profile, runtime_profile, **kwargs):  # noqa: ANN001
-                del job_id, job_paths, profile, runtime_profile
-                return SimpleNamespace(
-                    profile=SimpleNamespace(name="mle-default", pull_policy=SimpleNamespace(value="if-missing")),
-                    runtime_profile=SimpleNamespace(pull_policy=None),
-                    workdir=kwargs["workdir"],
-                    env=tuple(sorted(kwargs["env"].items())),
-                    mounts=(),
-                    labels=(),
-                    run_as_user="1000:1000",
-                    workspace_layout=kwargs["layout"],
-                )
-
-            def start_session(spec, image_tag):  # noqa: ANN001
-                return SimpleNamespace(
-                    container_name="mle-test-session",
-                    image_tag=image_tag,
-                    profile=spec.profile,
-                    runtime_profile=spec.runtime_profile,
-                    workspace_layout=spec.workspace_layout,
-                    mounts=spec.mounts,
-                    workdir=spec.workdir,
-                    labels=spec.labels,
-                    run_as_user=spec.run_as_user,
-                    started_at=SimpleNamespace(isoformat=lambda: "2026-04-01T00:00:00+00:00"),
-                )
-
-            def exec_(session, command, **kwargs):  # noqa: ANN001
-                del session
-                exec_calls.append({"command": command, **kwargs})
+            def engine_run() -> str:
                 submission_dir = job_paths.workspace_dir / "submission"
                 submission_dir.mkdir(parents=True, exist_ok=True)
                 (submission_dir / "submission_registry.jsonl").write_text("", encoding="utf-8")
                 fallback_path = job_paths.workspace_dir / "code" / "output"
                 fallback_path.mkdir(parents=True, exist_ok=True)
                 (fallback_path / "submission.csv").write_text("id,target\n1,0\n", encoding="utf-8")
-                return SimpleNamespace(exit_code=0, stdout="ok", stderr="", combined_output="ok")
-
-            runtime.prepare_image = prepare_image
-            runtime.create_session_spec = create_session_spec
-            runtime.start_session = start_session
-            runtime.exec = exec_
-            runtime.cleanup = lambda session: None
-            runtime.inspect_session = lambda session: {}
+                return "engine finished"
 
             adapter = MLEDomainAdapter(runtime=runtime)
             job_paths = self._job_paths(tmp_path / "job")
@@ -471,13 +455,27 @@ class DataVisibilityAdapterTests(unittest.TestCase):
                     gpu_ids=[],
                     gpu_count=0,
                 ),
+                mode_spec=SimpleNamespace(validation_command=None),
             )
+            resolved_profile = SimpleNamespace(name="gpt-5.4")
 
-            adapter._run_real_loop(job, job_paths)
+            with (
+                mock.patch("aisci_domain_mle.adapter.default_domain_mle_profile", return_value=mock.sentinel.profile),
+                mock.patch.object(adapter, "_session_env", return_value={"LOGS_DIR": "/home/logs"}),
+                mock.patch.object(adapter, "_build_llm_client", return_value=mock.sentinel.llm),
+                mock.patch.object(adapter, "_orchestrator_runtime", return_value=mock.sentinel.runtime_config),
+                mock.patch("aisci_domain_mle.adapter.DockerShellInterface", return_value=mock.sentinel.shell),
+                mock.patch("aisci_domain_mle.adapter.EmbeddedMLEEngine") as engine_cls,
+            ):
+                engine_cls.return_value.run.side_effect = engine_run
+                adapter._run_real_loop(job, job_paths, resolved_profile)
 
-            self.assertEqual(exec_calls[0]["timeout_seconds"], 3765)
-            self.assertIn("timeout --signal=TERM --kill-after=30 3720", str(exec_calls[0]["command"]))
             self.assertTrue((job_paths.workspace_dir / "submission" / "submission.csv").is_file())
+            registry_text = (job_paths.workspace_dir / "submission" / "submission_registry.jsonl").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("champion_selected", registry_text)
+            runtime.cleanup.assert_called_once_with(runtime.start_session.return_value)
 
     def test_competition_name_cache_hit_stages_prepared_public_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

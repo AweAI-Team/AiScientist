@@ -115,7 +115,7 @@ def _mle_job(tmp_path: Path, bundle_path: Path) -> JobRecord:
         status=JobStatus.PENDING,
         phase=RunPhase.INGEST,
         objective="mle objective",
-        llm_profile="mle-default",
+        llm_profile="gpt-5.4",
         runtime_profile=RuntimeProfile(
             run_final_validation=False,
             workspace_layout=WorkspaceLayout.MLE,
@@ -348,7 +348,7 @@ def test_mle_adapter_stages_summary_and_submission(tmp_path: Path, monkeypatch) 
     runtime = DockerRuntimeManager()
     monkeypatch.setattr(runtime, "can_use_docker", lambda: True)
 
-    def fake_run_real_loop(job, job_paths) -> None:  # noqa: ANN001
+    def fake_run_real_loop(job, job_paths, llm_profile) -> None:  # noqa: ANN001,ARG001
         analysis_dir = job_paths.workspace_dir / "agent" / "analysis"
         analysis_dir.mkdir(parents=True, exist_ok=True)
         submission_dir = job_paths.workspace_dir / "submission"

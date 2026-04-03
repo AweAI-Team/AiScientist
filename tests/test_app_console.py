@@ -639,7 +639,7 @@ def test_mle_root_tui_invokes_launcher(monkeypatch) -> None:
     monkeypatch.setattr("aisci_app.cli._is_interactive_terminal", lambda: True)
     monkeypatch.setattr(
         "aisci_app.cli.run_mle_launcher",
-        lambda: called.__setitem__("value", True),
+        lambda store=None: called.__setitem__("value", True),  # noqa: ARG005
     )
 
     result = runner.invoke(app, ["mle", "--tui"])
@@ -725,7 +725,8 @@ def test_mle_root_tui_rejects_non_run_subcommands(monkeypatch) -> None:
     result = runner.invoke(app, ["mle", "--tui", "doctor"])
 
     assert result.exit_code != 0
-    assert "only supported with `run` or with no subcommand" in (result.stdout + result.stderr)
+    assert "only supported with" in result.stderr
+    assert "`aisci mle --tui`" in result.stderr
 
 
 def test_tui_once_renders_jobs(monkeypatch, tmp_path: Path) -> None:

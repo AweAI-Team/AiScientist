@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import sys
 from pathlib import Path
 from typing import Callable
@@ -64,10 +65,41 @@ def ensure_mlebench_import_root(repo_root: Path) -> Path:
     return resolved
 
 
+def _module_path_from_repo_root(module_name: str, repo_root: Path) -> Path | None:
+    parts = module_name.split(".")
+    file_candidate = repo_root.joinpath(*parts).with_suffix(".py")
+    if file_candidate.is_file():
+        return file_candidate
+    package_candidate = repo_root.joinpath(*parts) / "__init__.py"
+    if package_candidate.is_file():
+        return package_candidate
+    return None
+
+
+def _import_module_from_repo_path(module_name: str, *, repo_root: Path):
+    module_path = _module_path_from_repo_root(module_name, repo_root)
+    if module_path is None:
+        raise ModuleNotFoundError(module_name)
+    synthetic_name = f"aisci_dynamic_{module_name.replace('-', '_').replace('.', '_')}"
+    existing = sys.modules.get(synthetic_name)
+    if existing is not None:
+        return existing
+    spec = importlib.util.spec_from_file_location(synthetic_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"failed to load module from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[synthetic_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def import_mlebench_callable(import_string: str, *, repo_root: Path) -> Callable:
     module_name, fn_name = import_string.split(":")
     ensure_mlebench_import_root(repo_root)
-    module = importlib.import_module(module_name)
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError:
+        module = _import_module_from_repo_path(module_name, repo_root=repo_root)
     fn = getattr(module, fn_name)
     if not callable(fn):
         raise ValueError(f"import target is not callable: {import_string}")
@@ -76,4 +108,7 @@ def import_mlebench_callable(import_string: str, *, repo_root: Path) -> Callable
 
 def import_mlebench_module(module_name: str, *, repo_root: Path):
     ensure_mlebench_import_root(repo_root)
-    return importlib.import_module(module_name)
+    try:
+        return importlib.import_module(module_name)
+    except ModuleNotFoundError:
+        return _import_module_from_repo_path(module_name, repo_root=repo_root)
