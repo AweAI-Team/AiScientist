@@ -21,7 +21,7 @@ from aisci_core.models import (
 from aisci_core.paths import ensure_job_dirs, resolve_job_paths
 from aisci_domain_mle.adapter import MLEDomainAdapter
 from aisci_domain_paper.adapter import PaperDomainAdapter
-from aisci_runtime_docker.models import ContainerSession, DockerExecutionResult
+from aisci_runtime_docker.models import ContainerSession, DockerExecutionResult, SessionMount
 from aisci_runtime_docker.profiles import default_mle_profile, default_paper_profile
 from aisci_runtime_docker.runtime import DockerRuntimeError, DockerRuntimeManager
 
@@ -369,6 +369,7 @@ def test_mle_adapter_stages_summary_and_submission(tmp_path: Path, monkeypatch) 
         (job_paths.logs_dir / "conversation.jsonl").write_text("{}\n", encoding="utf-8")
         (job_paths.logs_dir / "summary.json").write_text("{}", encoding="utf-8")
         (job_paths.artifacts_dir / "champion_report.md").write_text("# Champion Report\n", encoding="utf-8")
+        (job_paths.state_dir / "sandbox_session.json").write_text("{}", encoding="utf-8")
 
     adapter = MLEDomainAdapter(runtime)
     monkeypatch.setattr(adapter, "_run_real_loop", fake_run_real_loop)
@@ -378,6 +379,8 @@ def test_mle_adapter_stages_summary_and_submission(tmp_path: Path, monkeypatch) 
     assert "champion_report" in artifact_types
     assert "submission_registry" in artifact_types
     assert "candidate_snapshot" in artifact_types
+    assert "resolved_llm_config" in artifact_types
+    assert "sandbox_session" in artifact_types
     job_paths = ensure_job_dirs(resolve_job_paths("mle-job"))
     registry_text = (job_paths.workspace_dir / "submission" / "submission_registry.jsonl").read_text(
         encoding="utf-8"
@@ -426,6 +429,30 @@ def test_runtime_session_spec_uses_canonical_mounts(tmp_path: Path, monkeypatch)
     assert "/home/logs" in targets
     assert "/workspace/logs" in targets
     assert spec.workdir == "/home/code"
+
+
+def test_runtime_session_spec_accepts_extra_mounts(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AISCI_REPO_ROOT", str(tmp_path))
+    _write_image_config(tmp_path)
+    runtime = DockerRuntimeManager()
+    job_paths = ensure_job_dirs(resolve_job_paths("layout-job-extra"))
+    runtime.ensure_layout(job_paths, WorkspaceLayout.MLE)
+    repo_root = tmp_path / "repo-root"
+    repo_root.mkdir(parents=True, exist_ok=True)
+    spec = runtime.create_session_spec(
+        "layout-job-extra",
+        job_paths,
+        default_mle_profile(),
+        RuntimeProfile(workspace_layout=WorkspaceLayout.MLE),
+        layout=WorkspaceLayout.MLE,
+        workdir="/home/code",
+        extra_mounts=(SessionMount(repo_root, "/opt/aisci-src", read_only=True),),
+    )
+    mounted = {
+        (mount.target, mount.read_only, mount.source.resolve())
+        for mount in spec.mounts
+    }
+    assert ("/opt/aisci-src", True, repo_root.resolve()) in mounted
 
 
 def test_start_session_applies_user_limits_network_and_labels(tmp_path: Path, monkeypatch) -> None:

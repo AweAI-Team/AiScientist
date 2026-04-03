@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import shlex
 import select
 import subprocess
 import sys
@@ -22,10 +23,12 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from aisci_app.presentation import paper_artifact_hints
-from aisci_core.models import JobRecord, JobStatus
+from aisci_app.presentation import build_mle_job_spec, default_mle_llm_profile_name, paper_artifact_hints
+from aisci_app.service import JobService
+from aisci_core.models import JobRecord, JobStatus, PullPolicy
 from aisci_core.paths import ensure_job_dirs, resolve_job_paths
 from aisci_core.store import JobStore
+from aisci_domain_mle.preflight import MLELaunchPreflight, evaluate_mle_launch_preflight
 
 DEFAULT_REFRESH_SECONDS = 2.0
 GPU_REFRESH_SECONDS = 1.0
@@ -259,6 +262,28 @@ MASCOT_FRAMES: dict[str, list[list[str]]] = {
     ],
 }
 
+MLE_TUI_PROFILE_OPTIONS = ("glm-5", "gpt-5.4", "gemini-3-flash")
+MLE_TUI_INPUT_MODES = ("competition_name", "local_zip", "data_dir")
+MLE_TUI_PULL_POLICIES = ("profile-default", "if-missing", "always", "never")
+
+
+@dataclass
+class MLELaunchState:
+    input_mode: str = "competition_name"
+    competition_name: str = "detecting-insults-in-social-commentary"
+    competition_zip_path: str = ""
+    data_dir: str = ""
+    mlebench_data_dir: str = ""
+    description_path: str = ""
+    sample_submission_path: str = ""
+    llm_profile: str = ""
+    gpu_ids_raw: str = "0"
+    gpus_raw: str = "0"
+    time_limit: str = "24h"
+    image: str = ""
+    pull_policy: str = "profile-default"
+    run_final_validation: bool = True
+
 
 @dataclass(frozen=True)
 class GpuStat:
@@ -336,6 +361,447 @@ class TUIRunResult:
     job_id: str | None
     completed: bool
     detached: bool
+
+
+def run_mle_launcher(
+    *,
+    store: JobStore | None = None,
+    console: Console | None = None,
+) -> TUIRunResult | None:
+    app = _MLELauncherApp(
+        store=store or JobStore(),
+        console=console or Console(),
+    )
+    return app.run()
+
+
+@dataclass(frozen=True)
+class _MLELauncherField:
+    key: str
+    label: str
+    value: str
+    hint: str = ""
+    editor: str = "text"
+
+
+class _MLELauncherApp:
+    def __init__(
+        self,
+        *,
+        store: JobStore,
+        console: Console,
+    ) -> None:
+        self.console = console
+        self.service = JobService(store=store)
+        self.state = MLELaunchState()
+        self.state.llm_profile = default_mle_llm_profile_name()
+        self.message = "Configure the launch, then press s to start."
+        self.preflight = MLELaunchPreflight(ready=True)
+        self.preflight_ran = False
+
+    def run(self) -> TUIRunResult | None:
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            raise RuntimeError("MLE launcher requires an interactive terminal.")
+        while True:
+            self.console.clear()
+            self.console.print(self._render())
+            command = self.console.input(
+                "[bold cyan]Action[/] [dim](number edit, s start, p preflight, q quit)[/]: "
+            ).strip()
+            if not command:
+                self.message = "Enter a field number, s, p, or q."
+                continue
+            lowered = command.lower()
+            if lowered == "q":
+                return None
+            if lowered == "s":
+                result = self._start_job()
+                if result is not None:
+                    return result
+                continue
+            if lowered == "p":
+                self._refresh_preflight()
+                continue
+            if command.isdigit():
+                self._edit_field(int(command))
+                continue
+            self.message = f"Unknown action: {command!r}"
+
+    def _render(self) -> RenderableType:
+        layout = Layout()
+        layout.split_column(
+            Layout(self._render_header(), name="header", size=4),
+            Layout(name="body"),
+            Layout(self._render_footer(), name="footer", size=3),
+        )
+        body = Layout()
+        body.split_row(
+            Layout(self._render_form(), name="form", ratio=2),
+            Layout(self._render_sidebar(), name="sidebar", ratio=3),
+        )
+        layout["body"].update(body)
+        return layout
+
+    def _render_header(self) -> RenderableType:
+        title = Text("AiScientist MLE Launcher", style="bold bright_white")
+        subtitle = Text()
+        subtitle.append("Host-side MLE engine", style="cyan")
+        subtitle.append("  ")
+        subtitle.append("Docker sandbox", style="yellow")
+        subtitle.append("  ")
+        subtitle.append(self.message, style="white" if self.preflight.ready else "yellow")
+        return Panel(Group(title, subtitle), box=box.ROUNDED, border_style="cyan")
+
+    def _render_form(self) -> RenderableType:
+        table = Table(
+            box=box.SIMPLE_HEAVY,
+            expand=True,
+            header_style="bold bright_white",
+            show_lines=False,
+            row_styles=["", "dim"],
+        )
+        table.add_column("#", width=3, justify="right")
+        table.add_column("Field", style="cyan", width=26)
+        table.add_column("Value", overflow="fold")
+        table.add_column("Hint", style="dim", overflow="fold")
+        for index, field in enumerate(self._fields(), start=1):
+            table.add_row(str(index), field.label, field.value, field.hint)
+        return Panel(table, title="Launch Settings", box=box.ROUNDED, border_style="cyan")
+
+    def _render_sidebar(self) -> RenderableType:
+        preview = Panel(
+            Text(self._command_preview(), style="white"),
+            title="Command Preview",
+            box=box.ROUNDED,
+            border_style="green",
+        )
+        notes = self._preflight_text()
+        details = Panel(
+            notes,
+            title="Preflight",
+            box=box.ROUNDED,
+            border_style="yellow" if self.preflight.ready else "red",
+        )
+        tips = Panel(
+            Text(
+                "This launcher exposes the common MLE fields.\n"
+                "For advanced flags such as validation_command or custom grading config,\n"
+                "use `aisci mle run ...` directly.",
+                style="dim",
+            ),
+            title="Notes",
+            box=box.ROUNDED,
+            border_style="bright_black",
+        )
+        return Group(preview, details, tips)
+
+    def _render_footer(self) -> RenderableType:
+        return Panel(
+            Text(
+                "number edit  s start+attach dashboard  p run launch preflight  q quit",
+                style="dim",
+            ),
+            box=box.SQUARE,
+            border_style="bright_black",
+        )
+
+    def _fields(self) -> list[_MLELauncherField]:
+        fields = [
+            _MLELauncherField(
+                key="input_mode",
+                label="Input Mode",
+                value=self._display_input_mode(),
+                hint="cycle competition name / local zip / prepared data dir",
+                editor="choice",
+            ),
+        ]
+        if self.state.input_mode == "competition_name":
+            fields.extend(
+                [
+                    _MLELauncherField(
+                        key="competition_name",
+                        label="Competition Name",
+                        value=_display_launcher_value(self.state.competition_name),
+                        hint="required",
+                    ),
+                    _MLELauncherField(
+                        key="mlebench_data_dir",
+                        label="MLE Cache Root",
+                        value=_display_launcher_value(self.state.mlebench_data_dir),
+                        hint="blank = ~/.cache/mle-bench/data",
+                    ),
+                ]
+            )
+        elif self.state.input_mode == "local_zip":
+            fields.extend(
+                [
+                    _MLELauncherField(
+                        key="competition_name",
+                        label="Competition Name",
+                        value=_display_launcher_value(self.state.competition_name),
+                        hint="optional but recommended for clearer metadata/grading",
+                    ),
+                    _MLELauncherField(
+                        key="competition_zip_path",
+                        label="Competition Zip",
+                        value=_display_launcher_value(self.state.competition_zip_path),
+                        hint="path to local zip file",
+                    ),
+                ]
+            )
+        else:
+            fields.append(
+                _MLELauncherField(
+                    key="data_dir",
+                    label="Prepared Data Dir",
+                    value=_display_launcher_value(self.state.data_dir),
+                    hint="path containing public MLE data",
+                )
+            )
+        fields.extend(
+            [
+                _MLELauncherField(
+                    key="description_path",
+                    label="Description Override",
+                    value=_display_launcher_value(self.state.description_path),
+                    hint="optional",
+                ),
+                _MLELauncherField(
+                    key="sample_submission_path",
+                    label="Sample Submission Override",
+                    value=_display_launcher_value(self.state.sample_submission_path),
+                    hint="optional",
+                ),
+                _MLELauncherField(
+                    key="llm_profile",
+                    label="LLM Profile",
+                    value=_display_launcher_value(self.state.llm_profile),
+                    hint="cycle glm-5 / gpt-5.4 / gemini-3-flash",
+                    editor="choice",
+                ),
+                _MLELauncherField(
+                    key="gpu_ids_raw",
+                    label="GPU IDs",
+                    value=_display_launcher_value(self.state.gpu_ids_raw),
+                    hint="comma-separated; clear this if you use GPU count",
+                ),
+                _MLELauncherField(
+                    key="gpus_raw",
+                    label="GPU Count",
+                    value=_display_launcher_value(self.state.gpus_raw),
+                    hint="leave 0 when GPU IDs are set",
+                ),
+                _MLELauncherField(
+                    key="time_limit",
+                    label="Time Limit",
+                    value=_display_launcher_value(self.state.time_limit),
+                    hint="examples: 9h, 24h, 90m",
+                ),
+                _MLELauncherField(
+                    key="image",
+                    label="Docker Image",
+                    value=_display_launcher_value(self.state.image),
+                    hint="blank = use shared image profile",
+                ),
+                _MLELauncherField(
+                    key="pull_policy",
+                    label="Pull Policy",
+                    value=_display_launcher_value(self.state.pull_policy),
+                    hint="cycle profile-default / if-missing / always / never",
+                    editor="choice",
+                ),
+                _MLELauncherField(
+                    key="run_final_validation",
+                    label="Final Validation",
+                    value="on" if self.state.run_final_validation else "off",
+                    hint="run final grading / validation after solve",
+                    editor="bool",
+                ),
+            ]
+        )
+        return fields
+
+    def _edit_field(self, index: int) -> None:
+        fields = self._fields()
+        if index < 1 or index > len(fields):
+            self.message = f"Field {index} is out of range."
+            return
+        field = fields[index - 1]
+        if field.editor == "choice":
+            self._cycle_field(field.key)
+            self.message = f"Updated {field.label}."
+            return
+        if field.editor == "bool":
+            current = bool(getattr(self.state, field.key))
+            setattr(self.state, field.key, not current)
+            self.message = f"Updated {field.label}."
+            return
+        prompt = (
+            f"[bold cyan]{field.label}[/]\n"
+            f"[dim]Current: {field.value}. Submit an empty value to clear.[/]\n> "
+        )
+        new_value = self.console.input(prompt)
+        setattr(self.state, field.key, new_value.strip())
+        self.message = f"Updated {field.label}."
+
+    def _cycle_field(self, key: str) -> None:
+        if key == "input_mode":
+            current = self.state.input_mode
+            options = list(MLE_TUI_INPUT_MODES)
+            next_index = (options.index(current) + 1) % len(options)
+            self.state.input_mode = options[next_index]
+            return
+        if key == "llm_profile":
+            current = self.state.llm_profile
+            options = list(MLE_TUI_PROFILE_OPTIONS)
+            next_index = (options.index(current) + 1) % len(options) if current in options else 0
+            self.state.llm_profile = options[next_index]
+            return
+        if key == "pull_policy":
+            current = self.state.pull_policy
+            options = list(MLE_TUI_PULL_POLICIES)
+            next_index = (options.index(current) + 1) % len(options) if current in options else 0
+            self.state.pull_policy = options[next_index]
+            return
+
+    def _refresh_preflight(self) -> None:
+        self.preflight_ran = True
+        try:
+            spec = self._build_spec()
+        except Exception as exc:  # noqa: BLE001
+            self.preflight = MLELaunchPreflight(ready=False, errors=(str(exc),))
+            self.message = str(exc)
+            return
+        self.preflight = evaluate_mle_launch_preflight(spec)
+        self.message = self.preflight.summary()
+
+    def _start_job(self) -> TUIRunResult | None:
+        self._refresh_preflight()
+        if not self.preflight.ready:
+            return None
+        spec = self._build_spec()
+        job = self.service.create_job(spec)
+        self.service.spawn_worker(job.id, wait=False)
+        self.console.clear()
+        self.console.print(
+            Panel(
+                Text(f"Started MLE job {job.id}. Attaching dashboard...", style="green"),
+                box=box.ROUNDED,
+                border_style="green",
+            )
+        )
+        return run_tui_dashboard(
+            job_id=job.id,
+            refresh_seconds=DEFAULT_REFRESH_SECONDS,
+            once=False,
+            exit_when_job_done=True,
+            store=self.service.store,
+            console=self.console,
+        )
+
+    def _build_spec(self):
+        gpu_ids = _parse_launcher_gpu_ids(self.state.gpu_ids_raw)
+        gpus = _parse_launcher_gpu_count(self.state.gpus_raw)
+        if gpu_ids and gpus > 0:
+            raise ValueError("Use either GPU IDs or GPU count, not both.")
+        competition_name = self.state.competition_name.strip() or None
+        competition_zip_path = None
+        data_dir = None
+        if self.state.input_mode == "competition_name":
+            if not competition_name:
+                raise ValueError("Competition name is required in competition-name mode.")
+        elif self.state.input_mode == "local_zip":
+            competition_zip_path = self.state.competition_zip_path.strip() or None
+            if not competition_zip_path:
+                raise ValueError("Competition zip path is required in local-zip mode.")
+        else:
+            competition_name = None
+            data_dir = self.state.data_dir.strip() or None
+            if not data_dir:
+                raise ValueError("Prepared data dir is required in data-dir mode.")
+        pull_policy = _launcher_pull_policy(self.state.pull_policy)
+        return build_mle_job_spec(
+            competition_name=competition_name,
+            competition_zip_path=competition_zip_path,
+            mlebench_data_dir=self.state.mlebench_data_dir.strip() or None,
+            workspace_zip=None,
+            competition_bundle_zip=None,
+            data_dir=data_dir,
+            code_repo_zip=None,
+            description_path=self.state.description_path.strip() or None,
+            sample_submission_path=self.state.sample_submission_path.strip() or None,
+            validation_command=None,
+            grading_config_path=None,
+            metric_direction=None,
+            llm_profile=self.state.llm_profile.strip() or default_mle_llm_profile_name(),
+            gpus=gpus,
+            gpu_ids=gpu_ids,
+            time_limit=self.state.time_limit.strip() or "24h",
+            image=self.state.image.strip() or None,
+            pull_policy=pull_policy,
+            run_final_validation=self.state.run_final_validation,
+        )
+
+    def _display_input_mode(self) -> str:
+        return {
+            "competition_name": "competition name",
+            "local_zip": "local zip",
+            "data_dir": "prepared data dir",
+        }.get(self.state.input_mode, self.state.input_mode)
+
+    def _command_preview(self) -> str:
+        command = ["aisci", "mle", "run"]
+        if self.state.input_mode == "competition_name":
+            if self.state.competition_name.strip():
+                command.extend(["--name", self.state.competition_name.strip()])
+            if self.state.mlebench_data_dir.strip():
+                command.extend(["--mlebench-data-dir", self.state.mlebench_data_dir.strip()])
+        elif self.state.input_mode == "local_zip":
+            if self.state.competition_name.strip():
+                command.extend(["--name", self.state.competition_name.strip()])
+            if self.state.competition_zip_path.strip():
+                command.extend(["--zip", self.state.competition_zip_path.strip()])
+        else:
+            if self.state.data_dir.strip():
+                command.extend(["--data-dir", self.state.data_dir.strip()])
+        if self.state.description_path.strip():
+            command.extend(["--description-path", self.state.description_path.strip()])
+        if self.state.sample_submission_path.strip():
+            command.extend(["--sample-submission-path", self.state.sample_submission_path.strip()])
+        if self.state.llm_profile.strip():
+            command.extend(["--llm-profile", self.state.llm_profile.strip()])
+        if self.state.gpu_ids_raw.strip():
+            command.extend(["--gpu-ids", self.state.gpu_ids_raw.strip()])
+        elif self.state.gpus_raw.strip() and self.state.gpus_raw.strip() != "0":
+            command.extend(["--gpus", self.state.gpus_raw.strip()])
+        if self.state.time_limit.strip():
+            command.extend(["--time-limit", self.state.time_limit.strip()])
+        if self.state.image.strip():
+            command.extend(["--image", self.state.image.strip()])
+        if self.state.pull_policy != "profile-default":
+            command.extend(["--pull-policy", self.state.pull_policy])
+        command.append("--run-final-validation" if self.state.run_final_validation else "--skip-final-validation")
+        command.extend(["--wait", "--tui"])
+        return " \\\n  ".join(shlex.quote(item) for item in command)
+
+    def _preflight_text(self) -> Text:
+        lines: list[tuple[str, str]] = []
+        if self.preflight.errors:
+            for item in self.preflight.errors:
+                lines.append(("bold red", f"error: {item}"))
+        if self.preflight.warnings:
+            for item in self.preflight.warnings:
+                lines.append(("yellow", f"warn: {item}"))
+        if not lines and self.preflight_ran:
+            lines.append(("green", "Preflight passed. No blocking errors or warnings."))
+        if not lines:
+            lines.append(("dim", "No preflight run yet. Press p to check launch readiness now."))
+        text = Text()
+        for index, (style, line) in enumerate(lines):
+            if index:
+                text.append("\n")
+            text.append(line, style=style)
+        return text
 
 
 def parse_nvidia_smi_csv(text: str) -> list[GpuStat]:
@@ -1036,6 +1502,35 @@ def _parse_int(value: str | None) -> int | None:
         return None
 
 
+def _parse_launcher_gpu_ids(raw: str | None) -> list[str]:
+    if raw is None:
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def _parse_launcher_gpu_count(raw: str | None) -> int:
+    if raw is None or not raw.strip():
+        return 0
+    try:
+        value = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError("GPU count must be an integer.") from exc
+    if value < 0:
+        raise ValueError("GPU count must be >= 0.")
+    return value
+
+
+def _launcher_pull_policy(value: str) -> PullPolicy | None:
+    normalized = value.strip().lower()
+    if not normalized or normalized == "profile-default":
+        return None
+    return PullPolicy(normalized)
+
+
+def _display_launcher_value(value: str | None) -> str:
+    return value if value else "[auto]"
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     if not path.exists() or not path.is_file():
         return {}
@@ -1224,8 +1719,7 @@ def _format_recent_event_text(record: dict[str, Any]) -> Text:
     phase = _phase_from_record(record)
     if isinstance(step, int):
         line.append(f"step {step}", style="bold cyan")
-        if phase:
-            line.append("  ")
+        line.append("  ")
     if phase:
         line.append(f"[{phase}]", style="magenta")
         line.append("  ")
@@ -1551,20 +2045,37 @@ def _workspace_tree_text(path: Path, *, depth: int) -> str:
     def walk(current: Path, prefix: str, level: int) -> None:
         if level >= depth:
             return
+        try:
+            visible_children = [child for child in current.iterdir() if child.name not in ignored]
+        except PermissionError:
+            lines.append(f"{prefix}└── [permission denied]")
+            return
         children = sorted(
-            [child for child in current.iterdir() if child.name not in ignored],
-            key=lambda child: (child.is_file(), child.name.lower()),
+            visible_children,
+            key=lambda child: (_safe_is_file(child), child.name.lower()),
         )
         for index, child in enumerate(children):
             connector = "└──" if index == len(children) - 1 else "├──"
-            label = f"{child.name}/" if child.is_dir() else child.name
+            try:
+                is_dir = child.is_dir()
+            except PermissionError:
+                lines.append(f"{prefix}{connector} {child.name} [permission denied]")
+                continue
+            label = f"{child.name}/" if is_dir else child.name
             lines.append(f"{prefix}{connector} {label}")
-            if child.is_dir():
+            if is_dir:
                 extension = "    " if index == len(children) - 1 else "│   "
                 walk(child, prefix + extension, level + 1)
 
     walk(path, "", 0)
     return "\n".join(lines)
+
+
+def _safe_is_file(path: Path) -> bool:
+    try:
+        return path.is_file()
+    except PermissionError:
+        return False
 
 
 def _conversation_view_text(path: Path, *, limit: int) -> str:

@@ -10,7 +10,8 @@ from typer.testing import CliRunner
 
 from aisci_app.cli import _log_targets_for_kind, app
 from aisci_app.worker_main import main as worker_main
-from aisci_app.presentation import paper_doctor_report, paper_job_summary
+from aisci_app.presentation import mle_job_summary, paper_doctor_report, paper_job_summary
+from aisci_core.models import JobRecord, JobSpec, JobStatus, JobType, MLESpec, PaperSpec, RunPhase, RuntimeProfile, WorkspaceLayout
 from aisci_app.tui import (
     TUIRunResult,
     _conversation_view_text,
@@ -23,7 +24,6 @@ from aisci_app.tui import (
     parse_nvidia_smi_csv,
     parse_nvidia_smi_process_csv,
 )
-from aisci_core.models import JobRecord, JobSpec, JobStatus, JobType, PaperSpec, RunPhase, RuntimeProfile, WorkspaceLayout
 from aisci_core.paths import ensure_job_dirs, resolve_job_paths
 from aisci_core.store import JobStore
 from aisci_app.service import JobService
@@ -43,6 +43,29 @@ def _paper_job_record(*, status: JobStatus, phase: RunPhase, error: str | None =
             run_final_validation=True,
         ),
         mode_spec=PaperSpec(pdf_path="/tmp/paper.pdf"),
+        created_at=now,
+        updated_at=now,
+        started_at=now,
+        ended_at=now,
+        error=error,
+    )
+
+
+def _mle_job_record(*, status: JobStatus, phase: RunPhase, error: str | None = None) -> JobRecord:
+    now = datetime.now().astimezone()
+    return JobRecord(
+        id="mle-job-cli",
+        job_type=JobType.MLE,
+        status=status,
+        phase=phase,
+        objective="mle cli",
+        llm_profile="mle-default",
+        runtime_profile=RuntimeProfile(
+            workspace_layout=WorkspaceLayout.MLE,
+            run_final_validation=True,
+            gpu_ids=["0"],
+        ),
+        mode_spec=MLESpec(competition_name="detecting-insults-in-social-commentary"),
         created_at=now,
         updated_at=now,
         started_at=now,
@@ -131,6 +154,50 @@ def _create_paper_job(tmp_path: Path):
     return job, paths
 
 
+def _create_mle_job(tmp_path: Path):
+    store = JobStore()
+    service = JobService(store=store)
+    job = service.create_job(
+        JobSpec(
+            job_type=JobType.MLE,
+            objective="mle console",
+            llm_profile="mle-default",
+            runtime_profile=RuntimeProfile(
+                workspace_layout=WorkspaceLayout.MLE,
+                run_final_validation=True,
+                gpu_ids=["0"],
+            ),
+            mode_spec=MLESpec(competition_name="detecting-insults-in-social-commentary"),
+        )
+    )
+    paths = ensure_job_dirs(resolve_job_paths(job.id))
+    (paths.logs_dir / "job.log").write_text("main log line\n", encoding="utf-8")
+    (paths.logs_dir / "agent.log").write_text("agent log line\n", encoding="utf-8")
+    (paths.logs_dir / "summary.json").write_text("{}", encoding="utf-8")
+    (paths.workspace_dir / "submission").mkdir(parents=True, exist_ok=True)
+    (paths.workspace_dir / "submission" / "submission.csv").write_text("id,target\n1,0\n", encoding="utf-8")
+    (paths.workspace_dir / "submission" / "submission_registry.jsonl").write_text(
+        '{"event":"champion_selected"}\n',
+        encoding="utf-8",
+    )
+    (paths.workspace_dir / "submission" / "candidates").mkdir(parents=True, exist_ok=True)
+    (paths.workspace_dir / "agent" / "analysis").mkdir(parents=True, exist_ok=True)
+    (paths.workspace_dir / "agent" / "analysis" / "summary.md").write_text("# analysis\n", encoding="utf-8")
+    (paths.workspace_dir / "agent" / "prioritized_tasks.md").write_text("# tasks\n", encoding="utf-8")
+    (paths.workspace_dir / "agent" / "impl_log.md").write_text("# impl\n", encoding="utf-8")
+    (paths.workspace_dir / "agent" / "exp_log.md").write_text("# exp\n", encoding="utf-8")
+    (paths.artifacts_dir / "champion_report.md").write_text("# champion\n", encoding="utf-8")
+    (paths.state_dir / "resolved_llm_config.json").write_text(
+        json.dumps({"profile": "mle-default", "backend": "openai"}),
+        encoding="utf-8",
+    )
+    (paths.state_dir / "sandbox_session.json").write_text(
+        json.dumps({"container_name": "mle-test-session"}),
+        encoding="utf-8",
+    )
+    return job, paths
+
+
 def test_paper_job_summary_exposes_product_signals(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("AISCI_REPO_ROOT", str(tmp_path))
     job, _ = _create_paper_job(tmp_path)
@@ -143,6 +210,18 @@ def test_paper_job_summary_exposes_product_signals(tmp_path: Path, monkeypatch) 
     assert any(item["label"] == "paper summary" for item in summary["paper_artifacts"])
     assert any(item["label"] == "resolved llm config" for item in summary["paper_artifacts"])
     assert any(item["label"] == "main prompt snapshot" for item in summary["paper_artifacts"])
+
+
+def test_mle_job_summary_exposes_product_signals(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("AISCI_REPO_ROOT", str(tmp_path))
+    job, _ = _create_mle_job(tmp_path)
+    summary = mle_job_summary(job)
+    assert summary["mle_capabilities"]["input_mode"] == "competition name: detecting-insults-in-social-commentary"
+    assert summary["mle_capabilities"]["final_validation"] == "enabled"
+    assert any(item["label"] == "sandbox session" for item in summary["mle_log_targets"])
+    assert any(item["label"] == "submission registry" for item in summary["mle_log_targets"])
+    assert any(item["label"] == "champion report" for item in summary["mle_artifacts"])
+    assert any(item["label"] == "resolved llm config" for item in summary["mle_artifacts"])
 
 
 def test_log_target_helper_lists_paper_logs(tmp_path: Path, monkeypatch) -> None:
@@ -193,6 +272,27 @@ def test_workspace_tree_text_renders_home_style_tree(tmp_path: Path) -> None:
     assert "reproduce.sh" in rendered
 
 
+def test_workspace_tree_text_tolerates_permission_denied(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    restricted = workspace / "logs"
+    restricted.mkdir(parents=True)
+
+    original_iterdir = Path.iterdir
+
+    def fake_iterdir(self):  # noqa: ANN001
+        if self == restricted:
+            raise PermissionError("denied")
+        yield from original_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+
+    rendered = _workspace_tree_text(workspace, depth=2)
+
+    assert "/home" in rendered
+    assert "logs/" in rendered
+    assert "[permission denied]" in rendered
+
+
 def test_truncate_block_lines_adds_ellipsis_when_over_limit() -> None:
     text = "a\nb\nc\nd"
     assert _truncate_block_lines(text, max_lines=3) == "a\nb\n..."
@@ -241,6 +341,20 @@ def test_format_recent_event_text_applies_structured_prefixes() -> None:
     assert any(span.style == "bold cyan" for span in rendered.spans)
     assert any(span.style == "magenta" for span in rendered.spans)
     assert any(span.style == "yellow" for span in rendered.spans)
+
+
+def test_format_recent_event_text_separates_step_from_summary_without_phase() -> None:
+    rendered = _format_recent_event_text(
+        {
+            "event_type": "model_response",
+            "step": 1,
+            "text": "I'll start by understanding the competition.",
+        }
+    )
+
+    assert rendered.plain == "step 1  I'll start by understanding the competition."
+    assert any(span.style == "bold cyan" for span in rendered.spans)
+    assert any(span.style == "bright_white" for span in rendered.spans)
 
 
 def test_recent_feed_prefers_operational_events_over_agent_transcript() -> None:
@@ -451,6 +565,167 @@ def test_paper_run_tui_detach_emits_started_payload(monkeypatch, tmp_path: Path)
     assert payload["job_id"] == created_job.id
     assert payload["status"] == "started"
     assert payload["worker"] == 4242
+
+
+def test_mle_run_tui_requires_wait() -> None:
+    runner = CliRunner()
+
+    result = runner.invoke(
+        app,
+        [
+            "mle",
+            "run",
+            "--name",
+            "detecting-insults-in-social-commentary",
+            "--detach",
+            "--tui",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "--tui requires --wait." in (result.stdout + result.stderr)
+
+
+def test_mle_run_tui_detach_emits_started_payload(monkeypatch) -> None:
+    runner = CliRunner()
+    created_job = _mle_job_record(status=JobStatus.PENDING, phase=RunPhase.INGEST)
+    captured: dict[str, object] = {}
+
+    class _Service:
+        def __init__(self) -> None:
+            self.store = type("_Store", (), {"get_job": lambda self, job_id: created_job})()
+
+        def create_job(self, spec) -> JobRecord:  # noqa: ANN001
+            return created_job
+
+        def spawn_worker(self, job_id: str, wait: bool = False) -> int:
+            captured["job_id"] = job_id
+            captured["wait"] = wait
+            return 31337
+
+    monkeypatch.setattr("aisci_app.cli.JobService", _Service)
+    monkeypatch.setattr("aisci_app.cli.build_mle_job_spec", lambda **kwargs: object())
+    monkeypatch.setattr("aisci_app.cli._ensure_mle_launch_ready", lambda spec: None)
+    monkeypatch.setattr("aisci_app.cli._is_interactive_terminal", lambda: True)
+    monkeypatch.setattr(
+        "aisci_app.cli._run_tui_or_exit",
+        lambda **kwargs: TUIRunResult(job_id=created_job.id, completed=False, detached=True),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "mle",
+            "run",
+            "--name",
+            "detecting-insults-in-social-commentary",
+            "--wait",
+            "--tui",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured["wait"] is False
+    payload = json.loads(result.stdout)
+    assert payload["job_id"] == created_job.id
+    assert payload["status"] == "started"
+    assert payload["worker"] == 31337
+
+
+def test_mle_root_tui_invokes_launcher(monkeypatch) -> None:
+    runner = CliRunner()
+    called = {"value": False}
+
+    monkeypatch.setattr("aisci_app.cli._is_interactive_terminal", lambda: True)
+    monkeypatch.setattr(
+        "aisci_app.cli.run_mle_launcher",
+        lambda: called.__setitem__("value", True),
+    )
+
+    result = runner.invoke(app, ["mle", "--tui"])
+
+    assert result.exit_code == 0
+    assert called["value"] is True
+
+
+def test_mle_root_tui_run_subcommand_inherits_dashboard_attach(monkeypatch) -> None:
+    runner = CliRunner()
+    created_job = _mle_job_record(status=JobStatus.PENDING, phase=RunPhase.INGEST)
+    captured: dict[str, object] = {}
+
+    class _Service:
+        def __init__(self) -> None:
+            self.store = type("_Store", (), {"get_job": lambda self, job_id: created_job})()
+
+        def create_job(self, spec) -> JobRecord:  # noqa: ANN001
+            return created_job
+
+        def spawn_worker(self, job_id: str, wait: bool = False) -> int:
+            captured["job_id"] = job_id
+            captured["wait"] = wait
+            return 5150
+
+    monkeypatch.setattr("aisci_app.cli.JobService", _Service)
+    monkeypatch.setattr("aisci_app.cli.build_mle_job_spec", lambda **kwargs: object())
+    monkeypatch.setattr("aisci_app.cli._ensure_mle_launch_ready", lambda spec: None)
+    monkeypatch.setattr("aisci_app.cli._is_interactive_terminal", lambda: True)
+    monkeypatch.setattr(
+        "aisci_app.cli._run_tui_or_exit",
+        lambda **kwargs: TUIRunResult(job_id=created_job.id, completed=False, detached=True),
+    )
+
+    result = runner.invoke(
+        app,
+        ["mle", "--tui", "run", "--name", "detecting-insults-in-social-commentary"],
+    )
+
+    assert result.exit_code == 0
+    assert captured["wait"] is False
+    payload = json.loads(result.stdout)
+    assert payload["job_id"] == created_job.id
+    assert payload["status"] == "started"
+    assert payload["worker"] == 5150
+
+
+def test_mle_root_tui_requires_interactive_terminal(monkeypatch) -> None:
+    runner = CliRunner()
+    monkeypatch.setattr("aisci_app.cli._is_interactive_terminal", lambda: False)
+
+    result = runner.invoke(app, ["mle", "--tui"])
+
+    assert result.exit_code != 0
+    assert "--tui requires an interactive terminal." in (result.stdout + result.stderr)
+
+
+def test_mle_root_tui_propagates_failed_launcher_exit(monkeypatch) -> None:
+    runner = CliRunner()
+    failed_job = _mle_job_record(status=JobStatus.FAILED, phase=RunPhase.VALIDATE, error="validation failed")
+
+    class _Store:
+        def get_job(self, job_id: str) -> JobRecord:
+            assert job_id == failed_job.id
+            return failed_job
+
+    monkeypatch.setattr("aisci_app.cli._is_interactive_terminal", lambda: True)
+    monkeypatch.setattr("aisci_app.cli.JobStore", _Store)
+    monkeypatch.setattr(
+        "aisci_app.cli.run_mle_launcher",
+        lambda store=None: TUIRunResult(job_id=failed_job.id, completed=True, detached=False),
+    )
+
+    result = runner.invoke(app, ["mle", "--tui"])
+
+    assert result.exit_code == 1
+
+
+def test_mle_root_tui_rejects_non_run_subcommands(monkeypatch) -> None:
+    runner = CliRunner()
+    monkeypatch.setattr("aisci_app.cli._is_interactive_terminal", lambda: True)
+
+    result = runner.invoke(app, ["mle", "--tui", "doctor"])
+
+    assert result.exit_code != 0
+    assert "only supported with `run` or with no subcommand" in (result.stdout + result.stderr)
 
 
 def test_tui_once_renders_jobs(monkeypatch, tmp_path: Path) -> None:

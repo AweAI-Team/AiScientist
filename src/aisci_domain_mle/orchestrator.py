@@ -15,18 +15,33 @@ Key patterns preserved from PaperBench:
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import os
+from pathlib import Path
+import shlex
 import sys
 import time
 from typing import Any
 
+from aisci_domain_mle.local_runtime_stubs import install_optional_dependency_stubs
+
+install_optional_dependency_stubs()
+
 import structlog
 
 from openai import BadRequestError
-from aisci_agent_runtime.llm_client import LLMClient, LLMConfig, ContextLengthError, ContentPolicyError, create_llm_client
+from aisci_agent_runtime.llm_client import LLMClient, ContextLengthError, ContentPolicyError
 from aisci_agent_runtime.shell_interface import ShellInterface
 from aisci_agent_runtime.subagents.base import SubagentConfig, SubagentOutput, SubagentStatus, prune_messages, prune_messages_individual, fix_message_consistency, _fmt
+from aisci_domain_mle.constants import is_file_as_bus_enabled
+from aisci_domain_mle.orchestrator_runtime import (
+    OrchestratorPaths,
+    OrchestratorRuntimeConfig,
+    build_task_prompt,
+    create_orchestrator_llm,
+    load_runtime_config_from_env,
+)
 from aisci_domain_mle.subagents.configs import (
     DEFAULT_ANALYSIS_CONFIG,
     DEFAULT_PRIORITIZATION_CONFIG,
@@ -49,9 +64,9 @@ from aisci_agent_runtime.tools.shell_tools import (
 )
 from aisci_domain_mle.tools.spawn_subagent_tool import SpawnSubagentTool
 from aisci_domain_mle.prompts.templates import (
-    MAIN_AGENT_SYSTEM_PROMPT,
     SUMMARY_FIRST_TIME_PROMPT,
     SUMMARY_INCREMENTAL_PROMPT,
+    main_agent_system_prompt_for_run,
 )
 from aisci_agent_runtime.log_utils import log_messages_to_file, log_model_response_event, log_tool_result_event, _box, _short
 from aisci_agent_runtime.summary_utils import (
@@ -62,11 +77,94 @@ from aisci_agent_runtime.summary_utils import (
 
 logger = structlog.stdlib.get_logger(component=__name__)
 
-# LOGS_DIR is extracted by MLE-Bench after the container stops.
-# All logs written here are preserved in the per-task run directory on the host.
-# If nonroot cannot create subdirs under /home/logs (base image entrypoint only did chmod a+rw),
-# we fall back to /home/agent/logs so the run can proceed.
 LOGS_DIR = os.environ.get("LOGS_DIR", "/home/logs")
+
+
+def _mapped_path(shell: ShellInterface | None, path: str) -> Path:
+    mapper = getattr(shell, "mapped", None)
+    if callable(mapper):
+        try:
+            mapped = mapper(path)
+        except Exception:
+            mapped = None
+        if mapped is not None:
+            return Path(mapped)
+    return Path(path)
+
+
+def _command_output(result: Any) -> str:
+    if hasattr(result, "output"):
+        value = getattr(result, "output")
+        if isinstance(value, str):
+            return value
+        return str(value or "")
+    if result is None:
+        return ""
+    return str(result)
+
+
+def _path_exists(shell: ShellInterface | None, path: str) -> bool:
+    if shell is not None and hasattr(shell, "file_exists"):
+        try:
+            return bool(shell.file_exists(path))
+        except Exception:
+            pass
+    return _mapped_path(shell, path).exists()
+
+
+def _ensure_local_dir(shell: ShellInterface | None, path: str) -> Path:
+    resolved = _mapped_path(shell, path)
+    resolved.mkdir(parents=True, exist_ok=True)
+    return resolved
+
+
+def _append_text(shell: ShellInterface | None, path: str, content: str) -> None:
+    if shell is not None and hasattr(shell, "append_file"):
+        try:
+            shell.append_file(path, content)
+            return
+        except Exception:
+            pass
+    resolved = _mapped_path(shell, path)
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    with resolved.open("a", encoding="utf-8") as handle:
+        handle.write(content)
+
+
+def _prepare_runtime_dirs(
+    shell: ShellInterface | None,
+    paths: OrchestratorPaths,
+) -> OrchestratorPaths:
+    """Create runtime directories and preserve upstream LOGS_DIR fallback."""
+    global LOGS_DIR
+
+    try:
+        _ensure_local_dir(shell, paths.logs_dir)
+        _ensure_local_dir(shell, f"{paths.logs_dir}/subagent_logs")
+    except PermissionError:
+        fallback_logs_dir = "/home/agent/logs"
+        _ensure_local_dir(shell, fallback_logs_dir)
+        _ensure_local_dir(shell, f"{fallback_logs_dir}/subagent_logs")
+        paths = replace(paths, logs_dir=fallback_logs_dir)
+        logger.warning(
+            "Using LOGS_DIR fallback",
+            logs_dir=paths.logs_dir,
+            reason="Permission denied on default LOGS_DIR",
+        )
+
+    LOGS_DIR = paths.logs_dir
+    os.environ["LOGS_DIR"] = paths.logs_dir
+    for directory in (
+        paths.home_root,
+        paths.data_dir,
+        paths.agent_dir,
+        paths.code_dir,
+        paths.submission_dir,
+        paths.logs_dir,
+        f"{paths.logs_dir}/subagent_logs",
+    ):
+        _ensure_local_dir(shell, directory)
+    return paths
 
 # ====================================================================== #
 # Subagent Adapter Tools (main agent dispatches to subagents via these)
@@ -76,9 +174,10 @@ LOGS_DIR = os.environ.get("LOGS_DIR", "/home/logs")
 class AnalyzeDataTool(Tool):
     """Main-agent tool to dispatch the Data Analysis Subagent."""
 
-    def __init__(self, shell: ShellInterface, llm: LLMClient):
+    def __init__(self, shell: ShellInterface, llm: LLMClient, paths: OrchestratorPaths):
         self._shell = shell
         self._llm = llm
+        self._paths = paths
         self._session_counter = 0
 
     def name(self) -> str:
@@ -87,19 +186,20 @@ class AnalyzeDataTool(Tool):
     def execute(self, shell, **kwargs) -> str:
         self._session_counter += 1
         ts = time.strftime("%Y%m%d_%H%M%S")
-        session_dir = f"{LOGS_DIR}/subagent_logs/analysis_{self._session_counter:03d}_{ts}"
-        os.makedirs(session_dir, mode=0o755, exist_ok=True)
+        session_dir = f"{self._paths.logs_dir}/subagent_logs/analysis_{self._session_counter:03d}_{ts}"
+        local_session_dir = _ensure_local_dir(self._shell, session_dir)
 
         config = SubagentConfig(
             max_steps=DEFAULT_ANALYSIS_CONFIG.max_steps,
             time_limit=DEFAULT_ANALYSIS_CONFIG.time_limit,
             reminder_freq=DEFAULT_ANALYSIS_CONFIG.reminder_freq,
-            log_dir=session_dir,
+            log_dir=str(local_session_dir),
         )
 
         context = (
-            "Analyze the competition data in /home/data/.\n"
-            "Read description.md, examine all data files, and produce /home/agent/analysis/summary.md.\n"
+            f"Analyze the competition data in {self._paths.data_dir}/.\n"
+            f"Read {self._paths.description_path}, examine all data files, "
+            f"and produce {self._paths.analysis_summary_path}.\n"
             "Include: competition overview, dataset shapes, column types, missing values, key features, "
             "evaluation metric, and strategy recommendations."
         )
@@ -133,9 +233,10 @@ class AnalyzeDataTool(Tool):
 class PrioritizeTasksTool(Tool):
     """Main-agent tool to dispatch the Prioritization Subagent."""
 
-    def __init__(self, shell: ShellInterface, llm: LLMClient):
+    def __init__(self, shell: ShellInterface, llm: LLMClient, paths: OrchestratorPaths):
         self._shell = shell
         self._llm = llm
+        self._paths = paths
         self._session_counter = 0
 
     def name(self) -> str:
@@ -144,23 +245,23 @@ class PrioritizeTasksTool(Tool):
     def execute(self, shell, **kwargs) -> str:
         self._session_counter += 1
         ts = time.strftime("%Y%m%d_%H%M%S")
-        session_dir = f"{LOGS_DIR}/subagent_logs/prio_{self._session_counter:03d}_{ts}"
-        os.makedirs(session_dir, mode=0o755, exist_ok=True)
+        session_dir = f"{self._paths.logs_dir}/subagent_logs/prio_{self._session_counter:03d}_{ts}"
+        local_session_dir = _ensure_local_dir(self._shell, session_dir)
 
         config = SubagentConfig(
             max_steps=DEFAULT_PRIORITIZATION_CONFIG.max_steps,
             time_limit=DEFAULT_PRIORITIZATION_CONFIG.time_limit,
             reminder_freq=DEFAULT_PRIORITIZATION_CONFIG.reminder_freq,
-            log_dir=session_dir,
+            log_dir=str(local_session_dir),
         )
 
         # Inject data analysis summary if available
         context_parts = [
             "Create a prioritized task list for this Kaggle competition.\n"
-            "Read /home/data/description.md and /home/data/sample_submission.csv.\n"
+            f"Read {self._paths.description_path} and {self._paths.sample_submission_path}.\n"
         ]
-        analysis_path = "/home/agent/analysis/summary.md"
-        if os.path.exists(analysis_path):
+        analysis_path = self._paths.analysis_summary_path
+        if _path_exists(self._shell, analysis_path):
             context_parts.append(f"Data analysis is available at {analysis_path} — read it for insights.\n")
         context = "\n".join(context_parts)
 
@@ -197,9 +298,11 @@ class ImplementTool(Tool):
     - Mode support (full / fix / explore / refine / ensemble)
     """
 
-    def __init__(self, shell: ShellInterface, llm: LLMClient):
+    def __init__(self, shell: ShellInterface, llm: LLMClient, paths: OrchestratorPaths, file_as_bus: bool = True):
         self._shell = shell
         self._llm = llm
+        self._paths = paths
+        self._file_as_bus = file_as_bus
         self._session_counter = 0
 
     def name(self) -> str:
@@ -211,42 +314,37 @@ class ImplementTool(Tool):
         task: str = "",
         mode: str = "full",
         context: str = "",
-        time_budget: int = 0,
+        time_budget: int | None = None,
         **kwargs,
     ) -> str:
         self._session_counter += 1
         ts = time.strftime("%Y%m%d_%H%M%S")
-        session_dir = f"{LOGS_DIR}/subagent_logs/impl_{self._session_counter:03d}_{ts}"
-        os.makedirs(session_dir, mode=0o755, exist_ok=True)
+        session_dir = f"{self._paths.logs_dir}/subagent_logs/impl_{self._session_counter:03d}_{ts}"
+        local_session_dir = _ensure_local_dir(self._shell, session_dir)
 
-        # Write session separator to impl_log — title must match grep pattern '^=== Implement Session'
-        _write_session_separator(
-            "/home/agent/impl_log.md",
-            f"Implement Session {self._session_counter}",
-            f"Mode: {mode} | Task: {task or '(full prioritization)'}",
-        )
+        if self._file_as_bus:
+            _write_session_separator(
+                self._shell,
+                self._paths.impl_log_path,
+                f"Implement Session {self._session_counter}",
+                f"Mode: {mode} | Task: {task or '(full prioritization)'}",
+            )
 
         mode = (mode or "full").strip().lower()
         if mode not in {"full", "fix", "explore", "refine", "ensemble"}:
             mode = "full"
 
-        # Determine time budget
-        if time_budget > 0:
+        # Determine time budget: mirrors legacy behavior.
+        if time_budget is not None:
             tl = time_budget
-        elif mode == "fix":
-            tl = min(10800, DEFAULT_IMPLEMENTATION_CONFIG.time_limit)  # 3h cap for targeted fixes
-        elif mode == "explore":
-            tl = min(32400, DEFAULT_IMPLEMENTATION_CONFIG.time_limit)  # 9h cap (explore / hypothesis runs)
-        elif mode == "ensemble":
-            tl = min(32400, DEFAULT_IMPLEMENTATION_CONFIG.time_limit)  # 9h cap (blending / stacking)
         else:
-            tl = DEFAULT_IMPLEMENTATION_CONFIG.time_limit  # full/refine: profile default (9h production)
+            tl = DEFAULT_IMPLEMENTATION_CONFIG.time_limit if mode == "full" else 7200
 
         config = SubagentConfig(
             max_steps=DEFAULT_IMPLEMENTATION_CONFIG.max_steps,
             time_limit=tl,
             reminder_freq=DEFAULT_IMPLEMENTATION_CONFIG.reminder_freq,
-            log_dir=session_dir,
+            log_dir=str(local_session_dir),
         )
 
         # Build context for the subagent
@@ -254,7 +352,7 @@ class ImplementTool(Tool):
         if mode == "full":
             context_parts.append(
                 "## Mode: Full Implementation\n"
-                "Read /home/agent/prioritized_tasks.md and work through tasks autonomously "
+                f"Read {self._paths.prioritized_tasks_path} and work through tasks autonomously "
                 "(P0 first, breadth-first strategy).\n"
             )
         elif mode == "explore":
@@ -286,26 +384,32 @@ class ImplementTool(Tool):
                     f"Apply targeted fixes for: {task}\n"
                 )
             else:
-                context_parts.append(
-                    "## Mode: Fix\n"
-                    "Apply targeted fixes. Read the context and experiment log (exp_log.md) to determine what to fix.\n"
-                )
+                if self._file_as_bus:
+                    context_parts.append(
+                        "## Mode: Fix\n"
+                        f"Apply targeted fixes. Read the context and experiment log ({self._paths.exp_log_path}) to determine what to fix.\n"
+                    )
+                else:
+                    context_parts.append(
+                        "## Mode: Fix\n"
+                        "Apply targeted fixes using the context in this message, git history, and the current codebase.\n"
+                    )
         if task and mode == "full":
             context_parts.append(f"## Focus\n{task}\n")
         if context:
             context_parts.append(f"## Context from previous rounds\n{context}\n")
 
         # Inject last experiment session for context continuity (PaperBench pattern: extract last session)
-        exp_log_path = "/home/agent/exp_log.md"
-        if os.path.exists(exp_log_path):
+        exp_log_path = self._paths.exp_log_path
+        if self._file_as_bus and _path_exists(self._shell, exp_log_path):
             try:
                 exp_log_cmd = (
-                    f"LAST_SEP=$(grep -n '^=== Experiment Session' {exp_log_path} 2>/dev/null "
+                    f"LAST_SEP=$(grep -n '^=== Experiment Session' {shlex.quote(exp_log_path)} 2>/dev/null "
                     f"| tail -1 | cut -d: -f1); "
-                    f"if [ -n \"$LAST_SEP\" ]; then sed -n \"${{LAST_SEP}},\\$p\" {exp_log_path}; "
-                    f"else cat {exp_log_path} 2>/dev/null || echo '(no experiment log yet)'; fi"
+                    f"if [ -n \"$LAST_SEP\" ]; then sed -n \"${{LAST_SEP}},\\$p\" {shlex.quote(exp_log_path)}; "
+                    f"else cat {shlex.quote(exp_log_path)} 2>/dev/null || echo '(no experiment log yet)'; fi"
                 )
-                exp_log_content = self._shell.send_command(exp_log_cmd, timeout=10).strip()
+                exp_log_content = _command_output(self._shell.send_command(exp_log_cmd, timeout=10)).strip()
                 if exp_log_content and exp_log_content != "(no experiment log yet)":
                     context_parts.append(
                         "### Recent Experiment History (auto-injected, last session)\n"
@@ -326,7 +430,7 @@ class ImplementTool(Tool):
         full_context = "\n".join(context_parts)
 
         logger.info("Implementation subagent started", mode=mode, session_dir=session_dir)
-        subagent = ImplementationSubagent(self._shell, self._llm, config)
+        subagent = ImplementationSubagent(self._shell, self._llm, config, file_as_bus=self._file_as_bus)
         result = subagent.run(context=full_context)
         logger.info("Implementation subagent finished", steps=result.num_steps, runtime_s=result.runtime_seconds)
 
@@ -375,8 +479,7 @@ class ImplementTool(Tool):
                         },
                         "time_budget": {
                             "type": "integer",
-                            "description": "Time budget in seconds (0 = use default)",
-                            # "description": "Time budget in seconds. Omit or 0 = use default (~9h full/refine/explore/ensemble caps, ~3h fix). For compute-intensive tasks (e.g. multi-fold CV, large-model fine-tuning, training on large image/NLP datasets), do not pass a short time_budget; use default.",
+                            "description": "Time budget in seconds. If not specified, a default is used based on mode.",
                         },
                     },
                     "required": [],
@@ -396,9 +499,11 @@ class RunExperimentTool(Tool):
     - Mode support (full / validate)
     """
 
-    def __init__(self, shell: ShellInterface, llm: LLMClient):
+    def __init__(self, shell: ShellInterface, llm: LLMClient, paths: OrchestratorPaths, file_as_bus: bool = True):
         self._shell = shell
         self._llm = llm
+        self._paths = paths
+        self._file_as_bus = file_as_bus
         self._session_counter = 0
 
     def name(self) -> str:
@@ -409,50 +514,51 @@ class RunExperimentTool(Tool):
         shell,
         task: str = "Run the solution and validate submission.csv",
         mode: str = "full",
-        time_budget: int = 0,
+        time_budget: int | None = None,
         **kwargs,
     ) -> str:
         self._session_counter += 1
         ts = time.strftime("%Y%m%d_%H%M%S")
-        session_dir = f"{LOGS_DIR}/subagent_logs/exp_{self._session_counter:03d}_{ts}"
-        os.makedirs(session_dir, mode=0o755, exist_ok=True)
+        session_dir = f"{self._paths.logs_dir}/subagent_logs/exp_{self._session_counter:03d}_{ts}"
+        local_session_dir = _ensure_local_dir(self._shell, session_dir)
 
-        # Write session separator to exp_log — title must match grep pattern '^=== Experiment Session'
-        _write_session_separator(
-            "/home/agent/exp_log.md",
-            f"Experiment Session {self._session_counter}",
-            f"Mode: {mode} | Task: {task}",
-        )
+        if self._file_as_bus:
+            _write_session_separator(
+                self._shell,
+                self._paths.exp_log_path,
+                f"Experiment Session {self._session_counter}",
+                f"Mode: {mode} | Task: {task}",
+            )
 
-        # Determine time budget
-        if time_budget > 0:
+        # Determine time budget: mirrors legacy behavior.
+        if time_budget is not None:
             tl = time_budget
         elif mode == "validate":
-            tl = EXPERIMENT_VALIDATE_TIME_LIMIT  # 5h for validate mode
+            tl = EXPERIMENT_VALIDATE_TIME_LIMIT
         else:
-            tl = DEFAULT_EXPERIMENT_CONFIG.time_limit  # 10h for full experiment
+            tl = DEFAULT_EXPERIMENT_CONFIG.time_limit
 
         config = SubagentConfig(
             max_steps=DEFAULT_EXPERIMENT_CONFIG.max_steps,
             time_limit=tl,
             reminder_freq=DEFAULT_EXPERIMENT_CONFIG.reminder_freq,
-            log_dir=session_dir,
+            log_dir=str(local_session_dir),
         )
 
         # Build context
         context_parts = [f"## Task\n{task}\n", f"## Mode: {mode}\n"]
 
         # Inject last implementation session for context continuity (PaperBench pattern: extract last session)
-        impl_log_path = "/home/agent/impl_log.md"
-        if os.path.exists(impl_log_path):
+        impl_log_path = self._paths.impl_log_path
+        if self._file_as_bus and _path_exists(self._shell, impl_log_path):
             try:
                 impl_log_cmd = (
-                    f"LAST_SEP=$(grep -n '^=== Implement Session' {impl_log_path} 2>/dev/null "
+                    f"LAST_SEP=$(grep -n '^=== Implement Session' {shlex.quote(impl_log_path)} 2>/dev/null "
                     f"| tail -1 | cut -d: -f1); "
-                    f"if [ -n \"$LAST_SEP\" ]; then sed -n \"${{LAST_SEP}},\\$p\" {impl_log_path}; "
-                    f"else cat {impl_log_path} 2>/dev/null || echo '(no implementation log yet)'; fi"
+                    f"if [ -n \"$LAST_SEP\" ]; then sed -n \"${{LAST_SEP}},\\$p\" {shlex.quote(impl_log_path)}; "
+                    f"else cat {shlex.quote(impl_log_path)} 2>/dev/null || echo '(no implementation log yet)'; fi"
                 )
-                impl_log_content = self._shell.send_command(impl_log_cmd, timeout=10).strip()
+                impl_log_content = _command_output(self._shell.send_command(impl_log_cmd, timeout=10)).strip()
                 if impl_log_content and impl_log_content != "(no implementation log yet)":
                     context_parts.append(
                         "### Recent Implementation History (auto-injected, last session)\n"
@@ -472,7 +578,7 @@ class RunExperimentTool(Tool):
         full_context = "\n".join(context_parts)
 
         logger.info("Experiment subagent started", mode=mode, session_dir=session_dir)
-        subagent = ExperimentSubagent(self._shell, self._llm, config)
+        subagent = ExperimentSubagent(self._shell, self._llm, config, file_as_bus=self._file_as_bus)
         result = subagent.run(context=full_context)
         logger.info("Experiment subagent finished", steps=result.num_steps, runtime_s=result.runtime_seconds)
 
@@ -503,8 +609,7 @@ class RunExperimentTool(Tool):
                         },
                         "time_budget": {
                             "type": "integer",
-                            "description": "Time budget in seconds (0 = use default)",
-                            # "description": "Time budget in seconds. Omit or 0 = use default (~10h full, ~5h validate). For compute-intensive tasks (e.g. multi-fold CV, large-model fine-tuning, training on large image/NLP datasets), do not pass a short time_budget; use default.",
+                            "description": "Time budget in seconds (default: ~10h for full, ~5h for validate)",
                         },
                     },
                     "required": [],
@@ -523,14 +628,15 @@ class SubmitTool(Tool):
     - column names don't match sample_submission.csv
     - row count doesn't match sample_submission.csv
 
-    Soft warnings (bypassed by calling submit() again): NaN values in submission.
-
-    Hard block (not bypassable): Early submission — accept only when ≥80% of time limit used (enforced on every attempt).
+    Soft warnings (shown once on first attempt, bypassed by calling submit() again):
+    - NaN values in submission
+    - Early submission (> 50% time remaining, first attempt only — PaperBench pattern)
     """
 
-    def __init__(self, time_limit: int, start_time: float, llm: "LLMClient | None" = None):
+    def __init__(self, time_limit: int, start_time: float, paths: OrchestratorPaths, llm: "LLMClient | None" = None):
         self._time_limit = time_limit
         self._start_time = start_time
+        self._paths = paths
         self._llm = llm  # used to exclude retry-wait from elapsed (use_real_time_limit)
         self._submit_attempts = 0  # counts real (non-blocked) attempts
 
@@ -548,22 +654,22 @@ class SubmitTool(Tool):
         warnings = []
 
         # Hard block 1: submission.csv must exist
-        if not os.path.exists("/home/submission/submission.csv"):
+        if not _path_exists(shell, self._paths.submission_csv_path):
             # Don't count this as a real attempt (PaperBench pattern)
             return (
                 "SUBMISSION BLOCKED:\n\n"
-                "❌ HARD BLOCK: /home/submission/submission.csv does not exist.\n"
+                f"❌ HARD BLOCK: {self._paths.submission_csv_path} does not exist.\n"
                 "You MUST generate a valid submission.csv before submitting.\n"
                 "Use implement() or bash to create it.\n\n"
                 "Fix this issue first. submit() will remain blocked until resolved."
             )
 
         # Format validation against sample_submission
-        if os.path.exists("/home/data/sample_submission.csv"):
+        if _path_exists(shell, self._paths.sample_submission_path):
             try:
                 import pandas as pd
-                sub = pd.read_csv("/home/submission/submission.csv")
-                sample = pd.read_csv("/home/data/sample_submission.csv")
+                sub = pd.read_csv(_mapped_path(shell, self._paths.submission_csv_path))
+                sample = pd.read_csv(_mapped_path(shell, self._paths.sample_submission_path))
 
                 # Column mismatch — HARD BLOCK (wrong columns = score zero)
                 if list(sub.columns) != list(sample.columns):
@@ -600,32 +706,24 @@ class SubmitTool(Tool):
         # Count this as a real attempt now (after all hard blocks passed)
         self._submit_attempts += 1
 
-        # Early submission block: accept only when ≥80% time used. Enforced on every attempt (not bypassable by calling submit again).
-        elapsed = self._real_elapsed()
-        time_ratio = elapsed / self._time_limit if self._time_limit > 0 else 1.0
-        remaining_hours = (self._time_limit - elapsed) / 3600.0
-        has_early_block = False
-        if time_ratio < 0.8:
-            has_early_block = True
-            warnings.append(
-                f"⚠ EARLY SUBMISSION: Only {time_ratio*100:.0f}% of time used. "
-                f"You have {remaining_hours:.1f} hours remaining. "
-                "Please continue to optimize your score: use implement() and run_experiment(). "
-                "Review /home/agent/prioritized_tasks.md for tasks you can still optimize. "
-                "submit() will not be accepted until at least 80% of the time limit has been used."
-            )
+        # Early submission warning — soft, only on FIRST real attempt (PaperBench pattern)
+        if self._submit_attempts == 1:
+            elapsed = self._real_elapsed()
+            time_ratio = elapsed / self._time_limit if self._time_limit > 0 else 1.0
+            remaining_hours = (self._time_limit - elapsed) / 3600.0
+            if time_ratio < 0.5:
+                warnings.append(
+                    f"⚠ EARLY SUBMISSION: Only {time_ratio*100:.0f}% of time used "
+                    f"({remaining_hours:.1f} hours remaining). "
+                    "You have significant time to improve your score. "
+                    f"Review {self._paths.prioritized_tasks_path} for P1/P2 tasks you can still tackle."
+                )
 
         if warnings:
-            footer = (
-                "\n\nsubmit() will remain blocked until at least 80% of the time limit has been used. "
-                "Use the remaining time to improve your model."
-                if has_early_block
-                else "\n\nIf you still want to submit despite the warnings above, call submit() again."
-            )
             return (
                 "SUBMIT PRE-CHECK WARNINGS:\n\n"
                 + "\n".join(f"- {w}" for w in warnings)
-                + footer
+                + "\n\nIf you still want to submit, call submit() again."
             )
 
         return "✅ Submission accepted. The agent will now terminate."
@@ -674,7 +772,12 @@ def _format_subagent_result(label: str, result: SubagentOutput) -> str:
     return f"{header}\n\n{result.content}{log_info}"
 
 
-def _write_session_separator(path: str, title: str, details: str) -> None:
+def _write_session_separator(
+    shell: ShellInterface | None,
+    path: str,
+    title: str,
+    details: str,
+) -> None:
     """Write a session separator matching PaperBench format so grep-based extraction works.
 
     The separator line must start with '=== <Title>' so that the last-session extraction
@@ -683,9 +786,7 @@ def _write_session_separator(path: str, title: str, details: str) -> None:
     """
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     separator = f"\n=== {title} ===\n**Time**: {ts} | {details}\n\n"
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a") as f:
-        f.write(separator)
+    _append_text(shell, path, separator)
 
 
 def _build_reminder(
@@ -695,12 +796,11 @@ def _build_reminder(
 ) -> str:
     """Build a periodic reminder — mirrors PaperBench's 4-stage + balance logic."""
     remaining = time_limit - elapsed
-    remaining_hours = remaining / 3600.0
     pct = elapsed / time_limit * 100 if time_limit > 0 else 0
 
     parts = [
         f"⏱ Step {step} | Time: {_fmt(elapsed)}/{_fmt(time_limit)} ({pct:.0f}%) | "
-        f"Remaining: {_fmt(remaining)} ({remaining_hours:.1f}h) | "
+        f"Remaining: {_fmt(remaining)} | "
         f"Impl calls: {impl_count} | Exp calls: {exp_count}"
     ]
 
@@ -708,41 +808,37 @@ def _build_reminder(
     if pct >= 85:
         if submission_exists:
             parts.append(
-                f"⚠️ You have {remaining_hours:.1f} hours remaining (<15%). Do not submit early — "
-                "finish current work and validate.\n"
+                "⚠️ Less than 15% time remaining.\n"
                 "- Make sure all changes are git committed\n"
                 "- Focus on finishing current work rather than starting new tasks\n"
                 "- Verify /home/submission/submission.csv is valid and up to date"
             )
         else:
             parts.append(
-                f"🚨 You have {remaining_hours:.1f} hours remaining AND submission.csv DOES NOT EXIST!\n"
+                "🚨 Less than 15% time remaining AND submission.csv DOES NOT EXIST!\n"
                 "Without submission.csv, your score is automatically ZERO.\n"
                 "Creating a valid submission.csv should be your only priority right now."
             )
     elif pct >= 70:
         if submission_exists:
             parts.append(
-                f"⚠️ You have {remaining_hours:.1f} hours remaining. Do not submit early — "
-                "continue with implement() and run_experiment() to improve your score.\n"
-                "- Continue improving your model and validate submission format\n"
+                "⚠️ 70%+ time used. Consider wrapping up current work.\n"
                 "- If submission.csv hasn't been validated recently, validate it now via run_experiment()\n"
                 "- Git commit all changes regularly\n"
-                "- Check /home/agent/prioritized_tasks.md for remaining P1/P2 tasks"
+                "- Avoid starting large new tasks — focus on finishing in-progress work"
             )
         else:
             parts.append(
-                f"🚨 You have {remaining_hours:.1f} hours remaining AND submission.csv DOES NOT EXIST!\n"
+                "🚨 70%+ time used AND submission.csv DOES NOT EXIST!\n"
                 "Without submission.csv, your score is automatically ZERO.\n"
                 "Use implement() immediately to generate a valid submission.csv."
             )
     elif pct >= 50:
         parts.append(
-            f"You have {remaining_hours:.1f} hours remaining. Keep improving — do NOT submit yet.\n"
-            "- Continue with implement() and run_experiment() to optimize your score.\n"
-            "- Validate submission format periodically via run_experiment().\n"
+            "50%+ time used. Keep improving — do NOT submit yet.\n"
             "- Check /home/agent/prioritized_tasks.md for remaining P1/P2 tasks\n"
-            "- Each additional model improvement earns more points; git commit regularly."
+            "- Each additional model improvement earns more points\n"
+            "- Git commit regularly!"
         )
         if not submission_exists:
             parts.append(
@@ -751,13 +847,10 @@ def _build_reminder(
             )
     else:
         # Early phase (<50%)
-        parts.append(
-            f"You have {remaining_hours:.1f} hours remaining. Do not submit early.\n"
-            "- Focus on P0-Critical tasks first. Check /home/agent/prioritized_tasks.md\n"
-            "- After P0, keep improving with P1/P2 via implement() and run_experiment()\n"
-            "- Enter Explore mode early (implement mode='explore') to compare diverse directions.\n"
-            "- Git commit regularly."
-        )
+        parts.append("Reminders:")
+        parts.append("- Focus on P0-Critical tasks first! Check /home/agent/prioritized_tasks.md")
+        parts.append("- Don't forget to git commit regularly!")
+        parts.append("- DO NOT submit early. After P0 tasks, keep improving with P1/P2 items.")
         if not submission_exists:
             parts.append(
                 "- IMPORTANT: submission.csv doesn't exist yet — "
@@ -800,209 +893,188 @@ def _build_reminder(
 # Main orchestrator
 # ====================================================================== #
 
-def main():
-    """Main entry point for the AI Scientist orchestrator."""
+class EmbeddedMLEEngine:
+    def __init__(
+        self,
+        *,
+        config: OrchestratorRuntimeConfig,
+        shell: ShellInterface,
+        llm: LLMClient,
+    ) -> None:
+        self.config = config
+        self.shell = shell
+        self.llm = llm
 
-    # ---- Configuration from environment ----
-    time_limit = int(os.environ.get("TIME_LIMIT_SECS", 14400))
-    max_steps = int(os.environ.get("AISCI_MAX_STEPS", 500))
-    reminder_freq = int(os.environ.get("AISCI_REMINDER_FREQ", 5))
-    model = os.environ.get("AISCI_MODEL", "gpt-5.4")
-    hardware = os.environ.get("HARDWARE", "unknown")
-    # Context reduction: "prune" (drop oldest ~30%) or "summary" (summarize then replace)
-    context_reduce_strategy = (os.environ.get("AISCI_CONTEXT_REDUCE_STRATEGY", "summary") or "summary").strip().lower()
-    summary_segment_ratio = float(os.environ.get("AISCI_SUMMARY_SEGMENT_RATIO", "0.3"))
-    summary_min_turns = int(os.environ.get("AISCI_SUMMARY_MIN_TURNS_TO_SUMMARIZE", "4"))
-    summary_segment_max_chars = int(os.environ.get("AISCI_SUMMARY_SEGMENT_MAX_CHARS", "25000"))
-    summary_incremental = (os.environ.get("AISCI_SUMMARY_INCREMENTAL", "true") or "true").strip().lower() in ("true", "1", "yes")
+    def run(self) -> str:
+        runtime = self.config
+        paths = _prepare_runtime_dirs(self.shell, runtime.paths)
 
-    logger.info("Starting AI Scientist orchestrator",
-                time_limit=time_limit, max_steps=max_steps, model=model,
-                api_mode=os.environ.get("AISCI_API_MODE", "completions"), hardware=hardware,
-                context_reduce_strategy=context_reduce_strategy)
+        logger.info(
+            "Starting AI Scientist orchestrator",
+            time_limit=runtime.time_limit,
+            max_steps=runtime.max_steps,
+            model=runtime.model,
+            api_mode=runtime.api_mode,
+            hardware=runtime.hardware,
+            context_reduce_strategy=runtime.context_reduce_strategy,
+            file_as_bus=runtime.file_as_bus,
+            home_root=paths.home_root,
+            logs_dir=paths.logs_dir,
+        )
 
-    # ---- Initialise infrastructure ----
-    shell = ShellInterface(working_dir="/home")
-    api_mode = os.environ.get("AISCI_API_MODE", "completions")
-    llm = create_llm_client()  # reads model, api_mode, web_search, reasoning from env vars
+        self.shell.send_command(
+            f"cd {shlex.quote(paths.code_dir)} && git init && git add -A && git commit -m 'init' --allow-empty",
+            timeout=30,
+        )
 
-    # Create directories; if nonroot cannot write to LOGS_DIR (e.g. base image only did chmod a+rw on /home/logs),
-    # fall back to /home/agent/logs so the run can proceed.
-    global LOGS_DIR
-    try:
-        os.makedirs(LOGS_DIR, mode=0o755, exist_ok=True)
-        os.makedirs(f"{LOGS_DIR}/subagent_logs", mode=0o755, exist_ok=True)
-    except PermissionError:
-        LOGS_DIR = "/home/agent/logs"
-        os.makedirs(LOGS_DIR, mode=0o755, exist_ok=True)
-        os.makedirs(f"{LOGS_DIR}/subagent_logs", mode=0o755, exist_ok=True)
-        logger.warning("Using LOGS_DIR fallback", logs_dir=LOGS_DIR, reason="Permission denied on default LOGS_DIR")
-    for d in ["/home/agent", LOGS_DIR, f"{LOGS_DIR}/subagent_logs", "/home/code", "/home/submission"]:
-        os.makedirs(d, mode=0o755, exist_ok=True)
+        env_info = {
+            "model": runtime.model,
+            "api_mode": runtime.api_mode,
+            "web_search": os.environ.get("AISCI_WEB_SEARCH", "false"),
+            "reasoning_effort": os.environ.get("AISCI_REASONING_EFFORT", ""),
+            "time_limit": runtime.time_limit,
+            "max_steps": runtime.max_steps,
+            "hardware": runtime.hardware,
+            "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "competition_id": os.environ.get("COMPETITION_ID", "unknown"),
+            "file_as_bus": runtime.file_as_bus,
+            "paths": {
+                "data_dir": paths.data_dir,
+                "code_dir": paths.code_dir,
+                "submission_dir": paths.submission_dir,
+                "agent_dir": paths.agent_dir,
+                "logs_dir": paths.logs_dir,
+            },
+        }
+        env_json = json.dumps(env_info, indent=2)
+        self.shell.write_file(paths.agent_env_path, env_json)
+        self.shell.write_file(f"{paths.logs_dir}/env.json", env_json)
 
-    # Initialise git in /home/code
-    shell.send_command("cd /home/code && git init && git add -A && git commit -m 'init' --allow-empty", timeout=30)
+        start_time = time.time()
+        tools: list[Tool] = [
+            BashToolWithTimeout(default_timeout=MAIN_BASH_DEFAULT_TIMEOUT, max_timeout=MAIN_BASH_MAX_TIMEOUT),
+            PythonTool(default_timeout=MAIN_BASH_DEFAULT_TIMEOUT, max_timeout=MAIN_BASH_MAX_TIMEOUT),
+            ReadFileChunkTool(),
+            SearchFileTool(),
+            AnalyzeDataTool(self.shell, self.llm, paths),
+            PrioritizeTasksTool(self.shell, self.llm, paths),
+            ImplementTool(self.shell, self.llm, paths, file_as_bus=runtime.file_as_bus),
+            RunExperimentTool(self.shell, self.llm, paths, file_as_bus=runtime.file_as_bus),
+            SpawnSubagentTool(self.shell, self.llm),
+            SubmitTool(time_limit=runtime.time_limit, start_time=start_time, paths=paths, llm=self.llm),
+        ]
 
-    # Dump environment info (to both /home/agent and LOGS_DIR)
-    env_info = {
-        "model": model,
-        "api_mode": api_mode,
-        "web_search": os.environ.get("AISCI_WEB_SEARCH", "false"),
-        "reasoning_effort": os.environ.get("AISCI_REASONING_EFFORT", ""),
-        "time_limit": time_limit,
-        "max_steps": max_steps,
-        "hardware": hardware,
-        "start_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "competition_id": os.environ.get("COMPETITION_ID", "unknown"),
-    }
-    env_json = json.dumps(env_info, indent=2)
-    shell.write_file("/home/agent/env.json", env_json)
-    shell.write_file(f"{LOGS_DIR}/env.json", env_json)
+        tool_schemas = [tool.get_tool_schema() for tool in tools]
+        tool_map = {tool.name(): tool for tool in tools}
+        messages: list[dict] = [
+            {"role": "system", "content": main_agent_system_prompt_for_run(runtime.file_as_bus)},
+            {"role": "user", "content": build_task_prompt(runtime)},
+        ]
 
-    # ---- Build tools ----
-    start_time = time.time()
+        convo_jsonl_path = str(_mapped_path(self.shell, f"{paths.logs_dir}/conversation.jsonl"))
+        agent_log_path = str(_mapped_path(self.shell, f"{paths.logs_dir}/agent.log"))
+        run_id = time.strftime("%Y%m%d_%H%M%S")
 
-    tools: list[Tool] = [
-        # Direct tools (information gathering)
-        BashToolWithTimeout(default_timeout=MAIN_BASH_DEFAULT_TIMEOUT, max_timeout=MAIN_BASH_MAX_TIMEOUT),
-        PythonTool(default_timeout=MAIN_BASH_DEFAULT_TIMEOUT, max_timeout=MAIN_BASH_MAX_TIMEOUT),
-        ReadFileChunkTool(),
-        SearchFileTool(),
+        log_messages_to_file(messages, agent_log_path)
 
-        # Subagent adapter tools
-        AnalyzeDataTool(shell, llm),
-        PrioritizeTasksTool(shell, llm),
-        ImplementTool(shell, llm),
-        RunExperimentTool(shell, llm),
+        impl_count = 0
+        exp_count = 0
+        submitted = False
+        last_summary = None
+        step = 0
+        for step in range(1, runtime.max_steps + 1):
+            # Exclude API retry-wait time from the agent's effective budget,
+            # mirroring PaperBench's use_real_time_limit=True behaviour.
+            elapsed = max(time.time() - start_time - self.llm.total_retry_time, 0.0)
 
-        # Generic subagent (explore/plan/general — like PaperBench's spawn_subagent)
-        SpawnSubagentTool(shell, llm),
+            if elapsed >= runtime.time_limit:
+                logger.info("Time limit reached", step=step, elapsed=elapsed)
+                _emergency_finalize(self.shell, paths)
+                break
 
-        # Completion
-        SubmitTool(time_limit=time_limit, start_time=start_time, llm=llm),
-    ]
-
-    tool_schemas = [t.get_tool_schema() for t in tools]
-    tool_map = {t.name(): t for t in tools}
-
-    # ---- Build initial messages ----
-    comp_id = os.environ.get("COMPETITION_ID", "").strip()
-    gpu_line = f"**Hardware**: {hardware}" if hardware != "unknown" else "**Hardware**: Check with `nvidia-smi`"
-    task_prompt = (
-        f"You have **{_fmt(time_limit)}** to solve this Kaggle competition.\n\n"
-        f"{gpu_line}\n\n"
-        "Competition data is in `/home/data/`. Read `/home/data/description.md` first.\n"
-        "Your code goes in `/home/code/` (git repo). Final submission goes to `/home/submission/submission.csv`.\n\n"
-        "Use three phases for medal optimization: Explore (0-40%) → Exploit (40-80%) → Ensemble (80-100%).\n"
-        "For submission format checks, use `bash /home/validate_submission.sh /home/submission/submission.csv`.\n"
-        "Start by analysing the data and creating a prioritized task list, then implement and validate."
-    )
-    messages: list[dict] = [
-        {"role": "system", "content": MAIN_AGENT_SYSTEM_PROMPT},
-        {"role": "user", "content": task_prompt},
-    ]
-
-    # Log paths — written to LOGS_DIR so MLE-Bench extracts them per-task
-    convo_jsonl_path = f"{LOGS_DIR}/conversation.jsonl"
-    agent_log_path = f"{LOGS_DIR}/agent.log"
-    run_id = time.strftime("%Y%m%d_%H%M%S")
-
-    # Write initial agent.log
-    log_messages_to_file(messages, agent_log_path)
-
-    # ---- Main loop ----
-    impl_count = 0
-    exp_count = 0
-    submitted = False
-    last_summary = None  # for incremental context summarization (strategy=summary)
-    for step in range(1, max_steps + 1):
-        # Exclude API retry-wait time from the agent's effective budget,
-        # mirroring PaperBench's use_real_time_limit=True behaviour.
-        elapsed = max(time.time() - start_time - llm.total_retry_time, 0.0)
-
-        if elapsed >= time_limit:
-            logger.info("Time limit reached", step=step, elapsed=elapsed)
-            # Emergency: copy any submission.csv if it exists in code directory
-            _emergency_finalize(shell)
-            break
-
-        # Periodic reminder
-        if step > 1 and step % reminder_freq == 0:
-            try:
-                sub_check = shell.send_command(
-                    "test -f /home/submission/submission.csv && echo EXISTS || echo MISSING",
-                    timeout=5
-                )
-                submission_exists = "EXISTS" in (sub_check or "")
-            except Exception:
-                submission_exists = False
-            reminder = _build_reminder(step, elapsed, time_limit, impl_count, exp_count, submission_exists)
-            messages.append({"role": "user", "content": reminder})
-
-        # ---- LLM call ----
-        try:
-            resp = llm.chat(messages, tools=tool_schemas)
-        except ContentPolicyError as e:
-            # o-series safety filter — fail immediately to preserve Azure quota.
-            # The triggering messages have already been dumped by the LLM client.
-            logger.error(
-                "Content policy violation — stopping orchestrator",
-                step=step, dump=e.dump_path,
-            )
-            break
-        except ContextLengthError as _ctx_err:
-            summary_succeeded_in_loop = False  # set True only when adaptive summary + retry succeeds
-            # strategy=summary: 优先 summary，失败时回退到 prune（保证程序不崩）
-            if context_reduce_strategy == "summary":
-                system_msgs = [m for m in messages if m.get("role") == "system"]
-                non_system = [m for m in messages if m.get("role") != "system"]
-                first_user = non_system[0] if (non_system and non_system[0].get("role") == "user") else None
-                rest = non_system[1:] if first_user else non_system
-                turns = parse_rest_into_turns(rest)
-                num_turns = len(turns)
-                if num_turns < summary_min_turns:
-                    logger.info(
-                        "Context length exceeded — too few turns for summary, falling back to prune",
-                        step=step, num_turns=num_turns, min_turns=summary_min_turns,
+            if step > 1 and step % runtime.reminder_freq == 0:
+                try:
+                    sub_check = self.shell.send_command(
+                        f"test -f {shlex.quote(paths.submission_csv_path)} && echo EXISTS || echo MISSING",
+                        timeout=5,
                     )
-                    if _ctx_err.prune_individual:
-                        messages = prune_messages_individual(
-                            messages,
-                            max_tokens_per_message=llm.config.prune_context_window,
+                    submission_exists = "EXISTS" in _command_output(sub_check)
+                except Exception:
+                    submission_exists = False
+                reminder = _build_reminder(step, elapsed, runtime.time_limit, impl_count, exp_count, submission_exists)
+                messages.append({"role": "user", "content": reminder})
+
+            try:
+                resp = self.llm.chat(messages, tools=tool_schemas)
+            except ContentPolicyError as e:
+                # o-series safety filter — fail immediately to preserve Azure quota.
+                # The triggering messages have already been dumped by the LLM client.
+                logger.error(
+                    "Content policy violation — stopping orchestrator",
+                    step=step, dump=e.dump_path,
+                )
+                break
+            except ContextLengthError as _ctx_err:
+                summary_succeeded_in_loop = False
+                if runtime.context_reduce_strategy == "summary":
+                    system_msgs = [m for m in messages if m.get("role") == "system"]
+                    non_system = [m for m in messages if m.get("role") != "system"]
+                    first_user = non_system[0] if (non_system and non_system[0].get("role") == "user") else None
+                    rest = non_system[1:] if first_user else non_system
+                    turns = parse_rest_into_turns(rest)
+                    num_turns = len(turns)
+                    if num_turns < runtime.summary_min_turns:
+                        logger.info(
+                            "Context length exceeded — too few turns for summary, falling back to prune",
+                            step=step, num_turns=num_turns, min_turns=runtime.summary_min_turns,
                         )
-                    messages = prune_messages(messages)
-                else:
-                    _summary_max_ratio = 0.95
-                    _summary_ratio_step = 0.1
-                    task_content = (first_user or {}).get("content") or ""
-                    if isinstance(task_content, list):
-                        task_content = " ".join(
-                            item.get("text", "") for item in task_content
-                            if isinstance(item, dict) and item.get("type") == "text"
-                        )
-                    task_for_prompt = (task_content[:2000] + "\n(task description truncated.)") if len(task_content) > 2000 else task_content
-                    original_messages = messages
-                    ratio = summary_segment_ratio
-                    while ratio <= _summary_max_ratio:
-                        target_drop_turns = max(1, min(int(num_turns * ratio), num_turns - 1))
-                        segment_messages = [m for t in turns[:target_drop_turns] for m in t]
-                        kept_tail_messages = [m for t in turns[target_drop_turns:] for m in t]
-                        segment_text = serialize_segment_messages(
-                            segment_messages, segment_max_chars=summary_segment_max_chars
-                        )
-                        if summary_incremental and last_summary:
-                            prompt = SUMMARY_INCREMENTAL_PROMPT.format(
-                                task=task_for_prompt, last_summary=last_summary, segment=segment_text
+                        if _ctx_err.prune_individual:
+                            messages = prune_messages_individual(
+                                messages,
+                                max_tokens_per_message=self.llm.config.prune_context_window,
                             )
-                        else:
-                            prompt = SUMMARY_FIRST_TIME_PROMPT.format(task=task_for_prompt, segment=segment_text)
-                        summary_req_messages = [{"role": "user", "content": prompt}]
-                        summary_raw = ""
-                        summary_text = ""
-                        try:
-                            summary_resp = llm.chat(summary_req_messages, tools=None)
-                            summary_raw = (summary_resp.text_content or "").strip()
-                            if summary_raw and len(summary_raw) >= 50:
+                        messages = prune_messages(messages)
+                    else:
+                        summary_max_ratio = 0.95
+                        summary_ratio_step = 0.1
+                        task_content = (first_user or {}).get("content") or ""
+                        if isinstance(task_content, list):
+                            task_content = " ".join(
+                                item.get("text", "") for item in task_content
+                                if isinstance(item, dict) and item.get("type") == "text"
+                            )
+                        task_for_prompt = (
+                            task_content[:2000] + "\n(task description truncated.)"
+                            if len(task_content) > 2000
+                            else task_content
+                        )
+                        original_messages = messages
+                        ratio = runtime.summary_segment_ratio
+                        while ratio <= summary_max_ratio:
+                            target_drop_turns = max(1, min(int(num_turns * ratio), num_turns - 1))
+                            segment_messages = [m for turn in turns[:target_drop_turns] for m in turn]
+                            kept_tail_messages = [m for turn in turns[target_drop_turns:] for m in turn]
+                            segment_text = serialize_segment_messages(
+                                segment_messages,
+                                segment_max_chars=runtime.summary_segment_max_chars,
+                            )
+                            if runtime.summary_incremental and last_summary:
+                                prompt = SUMMARY_INCREMENTAL_PROMPT.format(
+                                    task=task_for_prompt,
+                                    last_summary=last_summary,
+                                    segment=segment_text,
+                                )
+                            else:
+                                prompt = SUMMARY_FIRST_TIME_PROMPT.format(
+                                    task=task_for_prompt,
+                                    segment=segment_text,
+                                )
+                            summary_req_messages = [{"role": "user", "content": prompt}]
+                            try:
+                                summary_resp = self.llm.chat(summary_req_messages, tools=None)
+                                summary_raw = (summary_resp.text_content or "").strip()
+                                if not summary_raw or len(summary_raw) < 50:
+                                    raise ValueError("Summary response empty or too short")
                                 if "Essential Information:" in summary_raw:
                                     summary_text = summary_raw.split("Essential Information:", 1)[-1].strip()
                                 else:
@@ -1011,314 +1083,333 @@ def main():
                                     summary_text = summary_text[:3000] + "\n(summary truncated.)"
                                 summary_user_content = SUMMARY_USER_INTRO + "\n\nSummary:\n" + summary_text
                                 summary_user_msg = {"role": "user", "content": summary_user_content}
-                                messages = system_msgs + ([first_user] if first_user else []) + [summary_user_msg] + kept_tail_messages
+                                messages = (
+                                    system_msgs
+                                    + ([first_user] if first_user else [])
+                                    + [summary_user_msg]
+                                    + kept_tail_messages
+                                )
                                 try:
-                                    sub_check = shell.send_command(
-                                        "test -f /home/submission/submission.csv && echo EXISTS || echo MISSING",
+                                    sub_check = self.shell.send_command(
+                                        f"test -f {shlex.quote(paths.submission_csv_path)} && echo EXISTS || echo MISSING",
                                         timeout=5,
                                     )
-                                    submission_exists = "EXISTS" in (sub_check or "")
+                                    submission_exists = "EXISTS" in _command_output(sub_check)
                                 except Exception:
                                     submission_exists = False
-                                elapsed_after = max(time.time() - start_time - llm.total_retry_time, 0.0)
+                                elapsed_after = max(time.time() - start_time - self.llm.total_retry_time, 0.0)
                                 reminder = _build_reminder(
-                                    step, elapsed_after, time_limit, impl_count, exp_count, submission_exists
+                                    step,
+                                    elapsed_after,
+                                    runtime.time_limit,
+                                    impl_count,
+                                    exp_count,
+                                    submission_exists,
                                 )
                                 messages.append({"role": "user", "content": reminder})
-                                resp = llm.chat(messages, tools=tool_schemas)
+                                resp = self.llm.chat(messages, tools=tool_schemas)
                                 last_summary = summary_text
                                 summary_succeeded_in_loop = True
                                 logger.info(
                                     "Context summarization succeeded; replaced N turns with summary",
                                     step=step, N=target_drop_turns, ratio_pct=int(ratio * 100),
                                 )
-                                try:
-                                    summary_log_path = os.path.join(LOGS_DIR, "context_summary_requests.jsonl")
-                                    record = {
-                                        "step": step,
-                                        "N": target_drop_turns,
-                                        "ratio_pct": int(ratio * 100),
-                                        "num_turns": num_turns,
-                                        "segment_chars": len(segment_text),
-                                        "summary_chars": len(summary_text),
-                                        "prompt_preview": prompt[:500] + ("..." if len(prompt) > 500 else ""),
-                                        "summary_preview": summary_text[:1000] + ("..." if len(summary_text) > 1000 else ""),
-                                    }
-                                    with open(summary_log_path, "a", encoding="utf-8") as f:
-                                        f.write(json.dumps(record, ensure_ascii=False) + "\n")
-                                except Exception as _e:
-                                    logger.debug("Failed to write context_summary_requests.jsonl", err=str(_e))
+                                record = {
+                                    "step": step,
+                                    "N": target_drop_turns,
+                                    "ratio_pct": int(ratio * 100),
+                                    "num_turns": num_turns,
+                                    "segment_chars": len(segment_text),
+                                    "summary_chars": len(summary_text),
+                                    "prompt_preview": prompt[:500] + ("..." if len(prompt) > 500 else ""),
+                                    "summary_preview": summary_text[:1000] + ("..." if len(summary_text) > 1000 else ""),
+                                }
+                                _append_text(
+                                    self.shell,
+                                    f"{paths.logs_dir}/context_summary_requests.jsonl",
+                                    json.dumps(record, ensure_ascii=False) + "\n",
+                                )
                                 break
-                            else:
-                                raise ValueError("Summary response empty or too short")
-                        except ContextLengthError:
+                            except ContextLengthError:
+                                logger.info(
+                                    "Context still over limit after summary at ratio %d%% — retrying with higher ratio (step=%s)",
+                                    int(ratio * 100), step,
+                                )
+                                ratio += summary_ratio_step
+                                continue
+                            except Exception as e:
+                                logger.warning(
+                                    "Context summarization failed (reason: %s); falling back to prune (step=%s).",
+                                    str(e)[:200], step,
+                                )
+                                break
+                        if not summary_succeeded_in_loop:
                             logger.info(
-                                "Context still over limit after summary at ratio %d%% — retrying with higher ratio (step=%s)",
-                                int(ratio * 100), step,
+                                "Context length exceeded — summary failed at all ratios, falling back to prune",
+                                step=step,
                             )
-                            ratio += _summary_ratio_step
-                            continue
-                        except Exception as e:
-                            logger.warning(
-                                "Context summarization failed (reason: %s); falling back to prune (step=%s).",
-                                str(e)[:200], step,
-                            )
-                            break
-                    if not summary_succeeded_in_loop:
-                        logger.info(
-                            "Context length exceeded — summary failed at all ratios, falling back to prune",
-                            step=step,
-                        )
-                        if _ctx_err.prune_individual:
-                            messages = prune_messages_individual(
-                                original_messages,
-                                max_tokens_per_message=llm.config.prune_context_window,
-                            )
+                            if _ctx_err.prune_individual:
+                                messages = prune_messages_individual(
+                                    original_messages,
+                                    max_tokens_per_message=self.llm.config.prune_context_window,
+                                )
+                            else:
+                                messages = original_messages
                             messages = prune_messages(messages)
-                        else:
-                            messages = prune_messages(original_messages)
-            else:
-                # context_reduce_strategy == "prune": 走 prune 路径
-                if _ctx_err.prune_individual:
-                    logger.warning(
-                        "Context length exceeded — truncating individual messages",
-                        step=step,
-                        context_window=llm.config.context_window,
-                        prune_context_window=llm.config.prune_context_window,
+                else:
+                    if _ctx_err.prune_individual:
+                        logger.warning(
+                            "Context length exceeded — truncating individual messages",
+                            step=step,
+                            context_window=self.llm.config.context_window,
+                            prune_context_window=self.llm.config.prune_context_window,
+                        )
+                        messages = prune_messages_individual(
+                            messages,
+                            max_tokens_per_message=self.llm.config.prune_context_window,
+                        )
+                    messages = prune_messages(messages)
+
+                if not summary_succeeded_in_loop:
+                    try:
+                        sub_check = self.shell.send_command(
+                            f"test -f {shlex.quote(paths.submission_csv_path)} && echo EXISTS || echo MISSING",
+                            timeout=5,
+                        )
+                        submission_exists = "EXISTS" in _command_output(sub_check)
+                    except Exception:
+                        submission_exists = False
+                    elapsed_after = max(time.time() - start_time - self.llm.total_retry_time, 0.0)
+                    reminder = _build_reminder(
+                        step,
+                        elapsed_after,
+                        runtime.time_limit,
+                        impl_count,
+                        exp_count,
+                        submission_exists,
                     )
-                    messages = prune_messages_individual(
-                        messages,
-                        max_tokens_per_message=llm.config.prune_context_window,
-                    )
-                messages = prune_messages(messages)
-            # after context reduction (prune or summary), inject reminder and retry unless we already succeeded in summary loop
-            if not summary_succeeded_in_loop:
-                try:
-                    sub_check = shell.send_command(
-                        "test -f /home/submission/submission.csv && echo EXISTS || echo MISSING",
-                        timeout=5,
-                    )
-                    submission_exists = "EXISTS" in (sub_check or "")
-                except Exception:
-                    submission_exists = False
-                elapsed_after = max(time.time() - start_time - llm.total_retry_time, 0.0)
-                reminder = _build_reminder(
-                    step, elapsed_after, time_limit, impl_count, exp_count, submission_exists
+                    messages.append({"role": "user", "content": reminder})
+                    try:
+                        resp = self.llm.chat(messages, tools=tool_schemas)
+                    except ContextLengthError:
+                        logger.error("Context length exceeded even after pruning — aborting", step=step)
+                        break
+                    except ContentPolicyError as e:
+                        logger.error("Content policy violation after pruning", step=step, dump=e.dump_path)
+                        break
+                    except Exception as e:
+                        logger.error("LLM call failed after pruning", step=step, err=str(e))
+                        break
+            except BadRequestError as e:
+                error_code = str(getattr(e, "code", "") or "")
+                logger.warning(
+                    "BadRequestError — fixing message consistency",
+                    step=step, error_code=error_code, err=str(e)[:200],
                 )
-                messages.append({"role": "user", "content": reminder})
+                messages = fix_message_consistency(messages)
                 try:
-                    resp = llm.chat(messages, tools=tool_schemas)
-                except ContextLengthError:
-                    logger.error("Context length exceeded even after pruning — aborting", step=step)
+                    resp = self.llm.chat(messages, tools=tool_schemas)
+                except Exception as e2:
+                    logger.error("LLM call failed after consistency fix", step=step, err=str(e2))
                     break
-                except ContentPolicyError as e:
-                    logger.error("Content policy violation after pruning", step=step, dump=e.dump_path)
-                    break
-                except Exception as e:
-                    logger.error("LLM call failed after pruning", step=step, err=str(e))
-                    break
-        except BadRequestError as e:
-            # Non-safety BadRequestErrors (e.g., -4003 "No tool output found"):
-            # fix message consistency first, then retry.
-            error_code = str(getattr(e, "code", "") or "")
-            logger.warning(
-                "BadRequestError — fixing message consistency",
-                step=step, error_code=error_code, err=str(e)[:200],
-            )
-            messages = fix_message_consistency(messages)
-            try:
-                resp = llm.chat(messages, tools=tool_schemas)
-            except Exception as e2:
-                logger.error("LLM call failed after consistency fix", step=step, err=str(e2))
-                break
-        except Exception as e:
-            logger.error("LLM call failed", step=step, err=str(e))
-            time.sleep(5)
-            try:
-                resp = llm.chat(messages, tools=tool_schemas)
-            except Exception as e2:
-                logger.error("LLM call failed on retry", step=step, err=str(e2))
-                break
-
-        # Log model response (structured JSONL)
-        log_model_response_event(
-            convo_path=convo_jsonl_path,
-            run_id=run_id,
-            step=step,
-            n_input_messages=len(messages),
-            text_content=resp.text_content,
-            tool_calls=[{"id": tc.call_id, "name": tc.name, "args": tc.arguments} for tc in resp.tool_calls],
-            usage=resp.usage,
-            reasoning_content=resp.reasoning_content,
-        )
-
-        # Build assistant message. reasoning_content is added only when the
-        # response has it: Completions API models that return it (GLM-5, Kimi
-        # use the same field name) need it written back; others (e.g. MiniMax
-        # uses reasoning_details, not yet handled here) do not get this key.
-        asst_msg: dict[str, Any] = {"role": "assistant", "content": resp.text_content}
-        if resp.reasoning_content:
-            asst_msg["reasoning_content"] = resp.reasoning_content
-        if resp.tool_calls:
-            asst_msg["tool_calls"] = [
-                {
-                    "id": tc.call_id,
-                    "type": "function",
-                    "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
-                    **({"extra_content": tc.extra_content} if tc.extra_content else {}),
-                }
-                for tc in resp.tool_calls
-            ]
-        # Responses API: store raw response.output so next request can inject
-        # it per official guide (platform.openai.com/docs/guides/reasoning):
-        # "pass in all output items from a previous response into the input
-        # of a new one."
-        raw = getattr(resp, "raw_message", None)
-        if isinstance(raw, list):
-            asst_msg["_response_output"] = raw
-        messages.append(asst_msg)
-
-        # Update human-readable agent.log
-        log_messages_to_file(messages, agent_log_path)
-
-        # GLM-5 / DeepSeek-R1: append reasoning chain as a separate box so it
-        # appears in agent.log immediately after the assistant reply.
-        if resp.reasoning_content:
-            reasoning_lines = _box(
-                "reasoning_content",
-                _short(resp.reasoning_content, 600),
-            )
-            try:
-                with open(agent_log_path, "a", encoding="utf-8") as _f:
-                    _f.write("\n".join(reasoning_lines) + "\n")
-            except Exception:
-                pass
-
-        # No tool calls — prompt continuation
-        if not resp.tool_calls:
-            if not resp.text_content:
-                messages.append({"role": "user", "content": "Please continue. Use your tools to make progress."})
-            continue
-
-        # ---- Execute tool calls ----
-        for tc in resp.tool_calls:
-            tool = tool_map.get(tc.name)
-            if not tool:
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.call_id,
-                    "content": f"Error: unknown tool '{tc.name}'. Available: {list(tool_map.keys())}",
-                })
-                continue
-
-            # Track impl/exp counts
-            if tc.name == "implement":
-                impl_count += 1
-            elif tc.name == "run_experiment":
-                exp_count += 1
-
-            try:
-                result = tool.execute(shell, **tc.arguments)
-
-                # Check for submit — only accepted when result contains the acceptance marker
-                if tc.name == "submit" and "✅ Submission accepted" in result:
-                    submitted = True
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.call_id,
-                        "content": result,
-                    })
-                    logger.info("Submission accepted", step=step)
-                    break
-
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.call_id,
-                    "content": str(result),
-                })
-                if tc.name in {"implement", "run_experiment"}:
-                    _snapshot_submission(shell, reason=tc.name)
             except Exception as e:
-                logger.error("Tool execution error", tool=tc.name, err=str(e))
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.call_id,
-                    "content": f"Error executing {tc.name}: {e}",
-                })
+                logger.error("LLM call failed", step=step, err=str(e))
+                time.sleep(5)
+                try:
+                    resp = self.llm.chat(messages, tools=tool_schemas)
+                except Exception as e2:
+                    logger.error("LLM call failed on retry", step=step, err=str(e2))
+                    break
 
-            log_tool_result_event(
+            log_model_response_event(
                 convo_path=convo_jsonl_path,
                 run_id=run_id,
                 step=step,
-                tool_name=tc.name,
-                tool_call_id=tc.call_id,
-                result_preview=messages[-1].get("content", ""),
+                n_input_messages=len(messages),
+                text_content=resp.text_content,
+                tool_calls=[{"id": tc.call_id, "name": tc.name, "args": tc.arguments} for tc in resp.tool_calls],
+                usage=resp.usage,
+                reasoning_content=resp.reasoning_content,
             )
-            # Update human-readable agent.log after each tool result
+
+            asst_msg: dict[str, Any] = {"role": "assistant", "content": resp.text_content}
+            if resp.reasoning_content:
+                asst_msg["reasoning_content"] = resp.reasoning_content
+            if resp.tool_calls:
+                asst_msg["tool_calls"] = [
+                    {
+                        "id": tc.call_id,
+                        "type": "function",
+                        "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)},
+                        **({"extra_content": tc.extra_content} if tc.extra_content else {}),
+                    }
+                    for tc in resp.tool_calls
+                ]
+            raw = getattr(resp, "raw_message", None)
+            if isinstance(raw, list):
+                asst_msg["_response_output"] = raw
+            messages.append(asst_msg)
+
             log_messages_to_file(messages, agent_log_path)
 
-        if submitted:
-            break
+        # GLM-5 / DeepSeek-R1: append reasoning chain as a separate box so it
+        # appears in agent.log immediately after the assistant reply.
+            if resp.reasoning_content:
+                reasoning_lines = _box(
+                    "reasoning_content",
+                    _short(resp.reasoning_content, 600),
+                )
+                try:
+                    _append_text(self.shell, f"{paths.logs_dir}/agent.log", "\n".join(reasoning_lines) + "\n")
+                except Exception:
+                    pass
 
-    # ---- Finalization ----
-    _finalize(shell, llm, start_time, impl_count, exp_count)
-    wall_elapsed = time.time() - start_time
-    real_elapsed = max(wall_elapsed - llm.total_retry_time, 0.0)
-    logger.info("Orchestrator finished",
-                steps=step,
-                wall_elapsed=wall_elapsed,
-                real_elapsed=real_elapsed,
-                total_retry_time=llm.total_retry_time,
-                tokens=llm.total_tokens, submitted=submitted)
+            if not resp.tool_calls:
+                if not resp.text_content:
+                    messages.append({"role": "user", "content": "Please continue. Use your tools to make progress."})
+                continue
+
+            for tc in resp.tool_calls:
+                tool = tool_map.get(tc.name)
+                if not tool:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.call_id,
+                        "content": f"Error: unknown tool '{tc.name}'. Available: {list(tool_map.keys())}",
+                    })
+                    continue
+
+                if tc.name == "implement":
+                    impl_count += 1
+                elif tc.name == "run_experiment":
+                    exp_count += 1
+
+                try:
+                    result = tool.execute(self.shell, **tc.arguments)
+
+                    if tc.name == "submit" and "✅ Submission accepted" in result:
+                        submitted = True
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.call_id,
+                            "content": result,
+                        })
+                        logger.info("Submission accepted", step=step)
+                        break
+
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.call_id,
+                        "content": str(result),
+                    })
+                    if tc.name in {"implement", "run_experiment"}:
+                        _snapshot_submission(self.shell, paths, reason=tc.name)
+                except Exception as e:
+                    logger.error("Tool execution error", tool=tc.name, err=str(e))
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.call_id,
+                        "content": f"Error executing {tc.name}: {e}",
+                    })
+
+                log_tool_result_event(
+                    convo_path=convo_jsonl_path,
+                    run_id=run_id,
+                    step=step,
+                    tool_name=tc.name,
+                    tool_call_id=tc.call_id,
+                    result_preview=messages[-1].get("content", ""),
+                )
+                log_messages_to_file(messages, agent_log_path)
+
+            if submitted:
+                break
+
+        _finalize(self.shell, self.llm, paths, start_time, impl_count, exp_count)
+        wall_elapsed = time.time() - start_time
+        real_elapsed = max(wall_elapsed - self.llm.total_retry_time, 0.0)
+        logger.info(
+            "Orchestrator finished",
+            steps=step,
+            wall_elapsed=wall_elapsed,
+            real_elapsed=real_elapsed,
+            total_retry_time=self.llm.total_retry_time,
+            tokens=self.llm.total_tokens,
+            submitted=submitted,
+        )
+        return (
+            f"MLE host-side engine finished after {step} steps; "
+            f"submitted={submitted}; real_elapsed={real_elapsed:.1f}s."
+        )
 
 
-def _emergency_finalize(shell: ShellInterface) -> None:
+def run(runtime: OrchestratorRuntimeConfig | None = None) -> None:
+    """Run the AI Scientist orchestrator with an explicit runtime config."""
+
+    runtime = runtime or load_runtime_config_from_env()
+    engine = EmbeddedMLEEngine(
+        config=runtime,
+        shell=ShellInterface(working_dir=runtime.paths.home_root),
+        llm=create_orchestrator_llm(runtime),
+    )
+    engine.run()
+
+def main() -> None:
+    run(load_runtime_config_from_env())
+
+
+def _emergency_finalize(shell: ShellInterface, paths: OrchestratorPaths) -> None:
     """Last-resort: copy any submission.csv found in code dir to submission dir."""
     candidates = [
-        "/home/code/submission.csv",
-        "/home/code/output/submission.csv",
-        "/home/code/submissions/submission.csv",
+        f"{paths.code_dir}/submission.csv",
+        f"{paths.code_dir}/output/submission.csv",
+        f"{paths.code_dir}/submissions/submission.csv",
     ]
-    if os.path.exists("/home/submission/submission.csv"):
+    if _path_exists(shell, paths.submission_csv_path):
         return
     for path in candidates:
-        if os.path.exists(path):
-            shell.send_command(f"cp {path} /home/submission/submission.csv", timeout=10)
+        if _path_exists(shell, path):
+            shell.send_command(
+                f"cp {shlex.quote(path)} {shlex.quote(paths.submission_csv_path)}",
+                timeout=10,
+            )
             logger.info("Emergency: copied submission.csv", src=path)
             return
 
 
-def _snapshot_submission(shell: ShellInterface, reason: str) -> None:
+def _snapshot_submission(shell: ShellInterface, paths: OrchestratorPaths, reason: str) -> None:
     """
     Keep immutable submission snapshots to prevent accidental regression/overwrite.
     """
-    src = "/home/submission/submission.csv"
-    if not os.path.exists(src):
+    src = paths.submission_csv_path
+    if not _path_exists(shell, src):
         return
     ts = time.strftime("%Y%m%d_%H%M%S")
     safe_reason = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in (reason or "snapshot"))
-    dst_dir = "/home/submission/candidates"
+    dst_dir = paths.submission_candidates_dir
     dst = f"{dst_dir}/submission_{ts}_{safe_reason}.csv"
     try:
-        os.makedirs(dst_dir, exist_ok=True)
-        shell.send_command(f"cp {src} {dst}", timeout=20)
+        _ensure_local_dir(shell, dst_dir)
+        shell.send_command(
+            f"cp {shlex.quote(src)} {shlex.quote(dst)}",
+            timeout=20,
+        )
         rec = {
             "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
             "reason": reason,
             "src": src,
             "dst": dst,
         }
-        reg = "/home/submission/submission_registry.jsonl"
-        with open(reg, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        reg = paths.submission_registry_path
+        _append_text(shell, reg, json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception as e:
         logger.debug("Failed to snapshot submission", reason=reason, err=str(e))
 
 
-def _finalize(shell: ShellInterface, llm: LLMClient, start_time: float,
+def _finalize(shell: ShellInterface, llm: LLMClient, paths: OrchestratorPaths, start_time: float,
               impl_count: int, exp_count: int) -> None:
     """Write final summary and copy important state files to LOGS_DIR."""
-    _emergency_finalize(shell)
+    _emergency_finalize(shell, paths)
 
     summary = {
         "runtime_seconds": time.time() - start_time,
@@ -1326,28 +1417,31 @@ def _finalize(shell: ShellInterface, llm: LLMClient, start_time: float,
         "total_retry_time": llm.total_retry_time,
         "impl_calls": impl_count,
         "exp_calls": exp_count,
-        "submission_exists": os.path.exists("/home/submission/submission.csv"),
+        "submission_exists": _path_exists(shell, paths.submission_csv_path),
         "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     summary_json = json.dumps(summary, indent=2)
     try:
-        shell.write_file("/home/agent/summary.json", summary_json)
-        shell.write_file(f"{LOGS_DIR}/summary.json", summary_json)
+        shell.write_file(paths.agent_summary_path, summary_json)
+        shell.write_file(f"{paths.logs_dir}/summary.json", summary_json)
     except Exception:
         pass
 
     # Copy important state files to LOGS_DIR for post-run inspection
     for src in [
-        "/home/agent/impl_log.md",
-        "/home/agent/exp_log.md",
-        "/home/agent/prioritized_tasks.md",
-        "/home/agent/analysis/summary.md",
-        "/home/submission/submission_registry.jsonl",
+        paths.impl_log_path,
+        paths.exp_log_path,
+        paths.prioritized_tasks_path,
+        paths.analysis_summary_path,
+        paths.submission_registry_path,
     ]:
-        if os.path.exists(src):
+        if _path_exists(shell, src):
             try:
-                dst = f"{LOGS_DIR}/{os.path.basename(src)}"
-                shell.send_command(f"cp {src} {dst}", timeout=10)
+                dst = f"{paths.logs_dir}/{os.path.basename(src)}"
+                shell.send_command(
+                    f"cp {shlex.quote(src)} {shlex.quote(dst)}",
+                    timeout=10,
+                )
             except Exception:
                 pass
 

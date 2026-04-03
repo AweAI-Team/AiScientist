@@ -88,8 +88,9 @@ class AgentSessionManager:
         entry_command: list[str] | tuple[str, ...] = (),
         env: dict[str, str] | None = None,
         workdir: str | None = None,
+        extra_mounts: tuple[SessionMount, ...] | list[SessionMount] = (),
     ) -> SessionSpec:
-        mounts = tuple(self._layout_mounts(job_paths, layout))
+        mounts = tuple([*self._layout_mounts(job_paths, layout), *list(extra_mounts)])
         return SessionSpec(
             job_id=job_id,
             workspace_layout=layout,
@@ -333,8 +334,16 @@ class AgentSessionManager:
         args: list[str] = []
         if runtime_profile.cpu_limit:
             args.extend(["--cpus", str(runtime_profile.cpu_limit)])
+        elif runtime_profile.nano_cpus is not None:
+            whole_cpus, fractional_nanos = divmod(runtime_profile.nano_cpus, 1_000_000_000)
+            cpu_limit = str(whole_cpus)
+            if fractional_nanos:
+                cpu_limit = f"{whole_cpus}.{fractional_nanos:09d}".rstrip("0")
+            args.extend(["--cpus", cpu_limit])
         if runtime_profile.memory_limit:
             args.extend(["--memory", str(runtime_profile.memory_limit)])
+        if runtime_profile.shm_size:
+            args.extend(["--shm-size", str(runtime_profile.shm_size)])
         return args
 
     def _gpu_args(self, runtime_profile: RuntimeProfile) -> list[str]:

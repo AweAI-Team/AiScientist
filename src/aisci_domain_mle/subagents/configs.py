@@ -4,7 +4,7 @@ Subagent configurations — mirrors PaperBench's profile-based config system.
 Two profiles:
 - **default** (production): generous time budgets matching PaperBench scale.
     PaperBench uses 24h overall with ~8h impl, 10h exp, 10h bash default.
-    MLE-Bench production uses 24h overall; implementation subagent default is 9h (see implementation.time_limit).
+    MLE-Bench production uses 24h overall; implementation subagent default is 8h (see implementation.time_limit).
 - **debug**: short budgets for fast iteration
 
 The active profile is selected via the ``AISCI_CONFIG_PROFILE`` env var
@@ -29,7 +29,7 @@ from aisci_agent_runtime.subagents.base import SubagentConfig
 _DEFAULT = {
     "analysis":       SubagentConfig(max_steps=200, time_limit=3600,  reminder_freq=15),
     "prioritization": SubagentConfig(max_steps=200, time_limit=3600,  reminder_freq=15),
-    "implementation": SubagentConfig(max_steps=500, time_limit=32400, reminder_freq=20),
+    "implementation": SubagentConfig(max_steps=500, time_limit=28800, reminder_freq=20),
     "experiment":     SubagentConfig(max_steps=500, time_limit=36000, reminder_freq=30),  # 4h→10h, PaperBench default
 
     "explore": SubagentConfig(max_steps=300, time_limit=14400, reminder_freq=15),  # 2h→4h
@@ -61,7 +61,7 @@ _DEFAULT = {
 _DEBUG = {
     "analysis":       SubagentConfig(max_steps=200, time_limit=3600,  reminder_freq=15),
     "prioritization": SubagentConfig(max_steps=200, time_limit=3600,  reminder_freq=15),
-    "implementation": SubagentConfig(max_steps=500, time_limit=32400, reminder_freq=20),
+    "implementation": SubagentConfig(max_steps=500, time_limit=28800, reminder_freq=20),
     "experiment":     SubagentConfig(max_steps=500, time_limit=36000, reminder_freq=30),
 
     "explore": SubagentConfig(max_steps=300, time_limit=14400, reminder_freq=15),

@@ -67,6 +67,8 @@ class RuntimeProfile(BaseModel):
     gpu_count: int = Field(default=0, ge=0)
     cpu_limit: str | None = None
     memory_limit: str | None = None
+    shm_size: str | None = None
+    nano_cpus: int | None = Field(default=None, ge=0)
     time_limit: str = "24h"
     image: str | None = None
     image_profile: str | None = None
@@ -109,6 +111,9 @@ class PaperSpec(BaseModel):
 
 
 class MLESpec(BaseModel):
+    competition_name: str | None = None
+    competition_zip_path: str | None = None
+    mlebench_data_dir: str | None = None
     workspace_bundle_zip: str | None = None
     competition_bundle_zip: str | None = None
     data_dir: str | None = None
@@ -123,9 +128,29 @@ class MLESpec(BaseModel):
 
     @model_validator(mode="after")
     def validate_inputs(self) -> "MLESpec":
-        if not any([self.workspace_bundle_zip, self.competition_bundle_zip, self.data_dir]):
+        configured_sources: list[str] = []
+        if self.competition_zip_path:
+            configured_sources.append("competition_zip_path")
+        elif self.competition_name:
+            configured_sources.append("competition_name")
+        configured_sources.extend(
+            name
+            for name, raw in (
+                ("workspace_bundle_zip", self.workspace_bundle_zip),
+                ("competition_bundle_zip", self.competition_bundle_zip),
+                ("data_dir", self.data_dir),
+            )
+            if raw
+        )
+        if not configured_sources:
             raise ValueError(
-                "mle job requires workspace_bundle_zip, competition_bundle_zip, or data_dir"
+                "mle job requires exactly one of competition_name, competition_zip_path, "
+                "workspace_bundle_zip, competition_bundle_zip, or data_dir"
+            )
+        if len(configured_sources) > 1:
+            raise ValueError(
+                "mle job requires exactly one competition data source; "
+                f"got {', '.join(configured_sources)}"
             )
         return self
 

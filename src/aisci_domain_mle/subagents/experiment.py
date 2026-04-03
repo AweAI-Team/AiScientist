@@ -35,7 +35,7 @@ from aisci_agent_runtime.tools.shell_tools import (
     ExecCommandTool,
     AddExpLogTool,
 )
-from aisci_domain_mle.prompts.templates import EXPERIMENT_SYSTEM_PROMPT
+from aisci_domain_mle.prompts.templates import experiment_system_prompt_for_run
 
 
 class ExperimentSubagent(Subagent):
@@ -50,18 +50,19 @@ class ExperimentSubagent(Subagent):
     - Record results to exp_log.md
     """
 
-    def __init__(self, shell, llm, config=None):
+    def __init__(self, shell, llm, config=None, *, file_as_bus: bool = True):
         super().__init__(shell, llm, config or DEFAULT_EXPERIMENT_CONFIG)
+        self._file_as_bus = file_as_bus
 
     @property
     def name(self) -> str:
         return "experiment"
 
     def system_prompt(self) -> str:
-        return EXPERIMENT_SYSTEM_PROMPT
+        return experiment_system_prompt_for_run(self._file_as_bus)
 
     def get_tools(self) -> list[Tool]:
-        return [
+        tools: list[Tool] = [
             # Information gathering
             ReadFileChunkTool(),
             SearchFileTool(),
@@ -85,9 +86,11 @@ class ExperimentSubagent(Subagent):
             GitCommitTool(),
 
             # Logging & completion
-            AddExpLogTool(),
-            SubagentCompleteTool(),
         ]
+        if self._file_as_bus:
+            tools.append(AddExpLogTool())
+        tools.append(SubagentCompleteTool())
+        return tools
 
     def _post_process_output(
         self, raw_output: str, artifacts: dict[str, Any]
