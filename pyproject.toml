@@ -6,15 +6,22 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
   "blobfile>=3.0.0",
+  "fastapi>=0.115.0",
+  "jinja2>=3.1.4",
+  "kaggle>=1.7.4.5",
   "openai>=1.99.9",
   "pandas>=2.2.0",
+  "pillow>=10.4.0",
   "pydantic>=2.10.0",
   "pypdf>=5.4.0",
+  "py7zr>=0.22.0",
+  "python-multipart>=0.0.9",
   "rich>=13.9.4",
   "scikit-learn>=1.5.0",
   "structlog>=25.1.0",
   "tenacity>=9.0.0",
   "tiktoken>=0.9.0",
+  "tqdm>=4.66.5",
   "pyyaml>=6.0.2",
   "typer>=0.12.5",
 ]
@@ -46,6 +53,8 @@ include = [
   "src/aisci_domain_mle/assets/*.md",
   "src/aisci_domain_paper/prompts/*.py",
   "src/aisci_domain_mle/prompts/*.py",
+  "src/aisci_domain_mle/vendored_mlebench_lite/**/*",
+  "src/aisci_app/templates/*.html",
   "docker/*.Dockerfile",
   "docker/*.sh",
 ]

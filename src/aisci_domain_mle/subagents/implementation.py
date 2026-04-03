@@ -35,7 +35,7 @@ from aisci_agent_runtime.tools.shell_tools import (
     GitCommitTool,
     AddImplLogTool,
 )
-from aisci_domain_mle.prompts.templates import IMPLEMENTATION_SYSTEM_PROMPT
+from aisci_domain_mle.prompts.templates import implementation_system_prompt_for_run
 
 
 class ImplementationSubagent(Subagent):
@@ -48,18 +48,19 @@ class ImplementationSubagent(Subagent):
     In "fix" mode it receives specific directives and applies targeted fixes.
     """
 
-    def __init__(self, shell, llm, config=None):
+    def __init__(self, shell, llm, config=None, *, file_as_bus: bool = True):
         super().__init__(shell, llm, config or DEFAULT_IMPLEMENTATION_CONFIG)
+        self._file_as_bus = file_as_bus
 
     @property
     def name(self) -> str:
         return "implementation"
 
     def system_prompt(self) -> str:
-        return IMPLEMENTATION_SYSTEM_PROMPT
+        return implementation_system_prompt_for_run(self._file_as_bus)
 
     def get_tools(self) -> list[Tool]:
-        return [
+        tools: list[Tool] = [
             # Information gathering
             ReadFileChunkTool(),
             SearchFileTool(),
@@ -77,11 +78,11 @@ class ImplementationSubagent(Subagent):
 
             # Git & logging
             GitCommitTool(),
-            AddImplLogTool(),
-
-            # Completion
-            SubagentCompleteTool(),
         ]
+        if self._file_as_bus:
+            tools.append(AddImplLogTool())
+        tools.append(SubagentCompleteTool())
+        return tools
 
     def _build_reminder(self, step: int, elapsed: float) -> str | None:
         """Enhanced reminder — mirrors PaperBench's 3-stage implementation reminder."""

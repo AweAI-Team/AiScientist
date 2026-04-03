@@ -13,8 +13,19 @@ from aisci_agent_runtime.llm_profiles import (
     resolve_llm_profile,
     resolved_profile_path,
 )
-from aisci_core.models import JobRecord, JobSpec, JobType, MLESpec, PaperSpec, PullPolicy, RuntimeProfile, WorkspaceLayout
+from aisci_core.models import (
+    JobRecord,
+    JobSpec,
+    JobType,
+    MLESpec,
+    NetworkPolicy,
+    PaperSpec,
+    PullPolicy,
+    RuntimeProfile,
+    WorkspaceLayout,
+)
 from aisci_core.paths import repo_root, resolve_job_paths
+from aisci_domain_mle.preflight import preflight_doctor_warnings, proxy_enabled
 from aisci_runtime_docker.profiles import (
     resolve_image_profile,
     resolved_image_profile_path,
@@ -58,6 +69,18 @@ def _paper_paths(job: JobRecord) -> dict[str, Path]:
         "analysis": job_paths.workspace_dir / "agent" / "paper_analysis",
         "submission": job_paths.workspace_dir / "submission",
     }
+
+
+def _resolved_mle_profile_path() -> Path:
+    return resolved_profile_path()
+
+
+def default_mle_llm_profile_name() -> str:
+    return resolve_llm_profile(
+        None,
+        default_for="mle",
+        profile_file=str(_resolved_mle_profile_path()),
+    ).name
 
 
 def _resolved_paper_capabilities(job: JobRecord) -> dict[str, Any]:
@@ -147,6 +170,137 @@ def paper_artifact_hints(job: JobRecord) -> list[PaperArtifactHint]:
     return [PaperArtifactHint(label, str(path), path.exists(), purpose) for label, path, purpose in candidates]
 
 
+def _mle_input_mode(job: JobRecord) -> str:
+    if job.job_type != JobType.MLE:
+        return "unknown"
+    assert isinstance(job.mode_spec, MLESpec)
+    spec = job.mode_spec
+    if spec.competition_name:
+        return f"competition name: {spec.competition_name}"
+    if spec.competition_zip_path:
+        return f"local zip: {Path(spec.competition_zip_path).name}"
+    if spec.workspace_bundle_zip:
+        return f"workspace zip: {Path(spec.workspace_bundle_zip).name}"
+    if spec.competition_bundle_zip:
+        return f"competition bundle: {Path(spec.competition_bundle_zip).name}"
+    if spec.data_dir:
+        return f"prepared data dir: {Path(spec.data_dir).name}"
+    return "custom input"
+
+
+def mle_capability_flags(job: JobRecord) -> dict[str, str]:
+    if job.job_type != JobType.MLE:
+        return {}
+    assert isinstance(job.mode_spec, MLESpec)
+    runtime = job.runtime_profile
+    validation_mode = "custom command" if job.mode_spec.validation_command else "submission format check"
+    eval_cmd = resolve_job_paths(job.id).workspace_dir / "data" / "eval_cmd.txt"
+    if eval_cmd.exists():
+        validation_mode = "eval_cmd.txt"
+    return {
+        "input_mode": _mle_input_mode(job),
+        "gpu_binding": ",".join(runtime.gpu_ids) if runtime.gpu_ids else str(runtime.gpu_count),
+        "final_validation": "enabled" if runtime.run_final_validation else "disabled",
+        "validation_mode": validation_mode,
+        "workspace_layout": runtime.workspace_layout.value if runtime.workspace_layout else "mle",
+        "runtime_image": runtime.image or f"profile:{runtime.image_profile or 'default'}",
+        "pull_policy": runtime.pull_policy.value if runtime.pull_policy else "profile-default",
+    }
+
+
+def mle_log_targets(job: JobRecord) -> list[PaperLogTarget]:
+    if job.job_type != JobType.MLE:
+        return []
+    job_paths = resolve_job_paths(job.id)
+    logs_dir = job_paths.logs_dir
+    subagent_dir = logs_dir / "subagent_logs"
+    candidates = [
+        ("main job log", logs_dir / "job.log", "main"),
+        ("worker log", logs_dir / "worker.log", "main"),
+        ("conversation log", logs_dir / "conversation.jsonl", "conversation"),
+        ("agent log", logs_dir / "agent.log", "agent"),
+        ("summary log", logs_dir / "summary.json", "summary"),
+        ("submission registry", job_paths.workspace_dir / "submission" / "submission_registry.jsonl", "submission"),
+        ("sandbox session", job_paths.state_dir / "sandbox_session.json", "sandbox"),
+        ("resolved llm config", job_paths.state_dir / "resolved_llm_config.json", "state"),
+        ("validation report", job_paths.artifacts_dir / "validation_report.json", "validation"),
+    ]
+    if subagent_dir.exists():
+        candidates.append(("subagent logs", subagent_dir, "subagent"))
+        for session_dir in sorted(path for path in subagent_dir.iterdir() if path.is_dir())[:20]:
+            candidates.append((f"session: {session_dir.name}", session_dir, "subagent_session"))
+    return [PaperLogTarget(label, str(path), path.exists(), kind) for label, path, kind in candidates]
+
+
+def mle_artifact_hints(job: JobRecord) -> list[PaperArtifactHint]:
+    if job.job_type != JobType.MLE:
+        return []
+    job_paths = resolve_job_paths(job.id)
+    candidates = [
+        (
+            "data description",
+            job_paths.workspace_dir / "data" / "description.md",
+            "Competition overview and public evaluation instructions staged into the solver workspace.",
+        ),
+        (
+            "sample submission",
+            job_paths.workspace_dir / "data" / "sample_submission.csv",
+            "Reference submission schema used by submit() pre-checks.",
+        ),
+        (
+            "analysis summary",
+            job_paths.workspace_dir / "agent" / "analysis" / "summary.md",
+            "Dataset inspection and modeling recommendations produced by analyze_data().",
+        ),
+        (
+            "prioritized tasks",
+            job_paths.workspace_dir / "agent" / "prioritized_tasks.md",
+            "Ranked optimization queue for the remaining runtime budget.",
+        ),
+        (
+            "implementation log",
+            job_paths.workspace_dir / "agent" / "impl_log.md",
+            "Changelog of code edits and implementation passes.",
+        ),
+        (
+            "experiment log",
+            job_paths.workspace_dir / "agent" / "exp_log.md",
+            "Experiment history, metrics, and validation notes.",
+        ),
+        (
+            "submission registry",
+            job_paths.workspace_dir / "submission" / "submission_registry.jsonl",
+            "Candidate history, champion selection, and final promotion events.",
+        ),
+        (
+            "final submission",
+            job_paths.workspace_dir / "submission" / "submission.csv",
+            "Current promoted submission that final validation reads.",
+        ),
+        (
+            "candidate snapshots",
+            job_paths.workspace_dir / "submission" / "candidates",
+            "Archived candidate submission CSVs captured during the run.",
+        ),
+        (
+            "champion report",
+            job_paths.artifacts_dir / "champion_report.md",
+            "Host-side summary of the latest selected candidate and registry path.",
+        ),
+        (
+            "resolved llm config",
+            job_paths.state_dir / "resolved_llm_config.json",
+            "Resolved backend, model, and provider-specific runtime settings selected on the host.",
+        ),
+        (
+            "sandbox session",
+            job_paths.state_dir / "sandbox_session.json",
+            "Persistent Docker sandbox metadata for this MLE run.",
+        ),
+    ]
+    return [PaperArtifactHint(label, str(path), path.exists(), purpose) for label, path, purpose in candidates]
+
+
 def build_job_spec_clone(
     job: JobRecord,
     *,
@@ -222,6 +376,9 @@ def build_paper_job_spec(
 
 def build_mle_job_spec(
     *,
+    competition_name: str | None,
+    competition_zip_path: str | None,
+    mlebench_data_dir: str | None,
     workspace_zip: str | None,
     competition_bundle_zip: str | None,
     data_dir: str | None,
@@ -247,6 +404,7 @@ def build_mle_job_spec(
         image=image,
         pull_policy=pull_policy,
         run_final_validation=run_final_validation,
+        network_policy=NetworkPolicy.BRIDGE,
         workspace_layout=WorkspaceLayout.MLE,
     )
     return JobSpec(
@@ -255,6 +413,9 @@ def build_mle_job_spec(
         llm_profile=llm_profile,
         runtime_profile=runtime,
         mode_spec=MLESpec(
+            competition_name=competition_name,
+            competition_zip_path=competition_zip_path,
+            mlebench_data_dir=mlebench_data_dir,
             workspace_bundle_zip=workspace_zip,
             competition_bundle_zip=competition_bundle_zip,
             data_dir=data_dir,
@@ -472,9 +633,155 @@ def paper_doctor_report() -> list[PaperDoctorCheck]:
     return checks
 
 
+def mle_doctor_report() -> list[PaperDoctorCheck]:
+    checks = [
+        PaperDoctorCheck("repo", "ok" if repo_root().exists() else "fail", f"root={repo_root()}"),
+        PaperDoctorCheck(
+            "app package",
+            "ok" if (repo_root() / "src" / "aisci_app").exists() else "fail",
+            "agent console code is present",
+        ),
+        PaperDoctorCheck(
+            "mle workspace",
+            "ok" if (repo_root() / "src" / "aisci_domain_mle").exists() else "warn",
+            "mle execution path is available",
+        ),
+    ]
+    docker = shutil.which("docker")
+    if docker:
+        try:
+            result = subprocess.run(
+                [docker, "info"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+            status = "ok" if result.returncode == 0 else "fail"
+            detail = (
+                "docker daemon reachable"
+                if result.returncode == 0
+                else ((result.stderr or result.stdout or "docker info failed") + "; mle jobs will not start without Docker")
+            )
+        except Exception as exc:
+            status = "fail"
+            detail = f"{exc}; mle jobs will not start without Docker"
+    else:
+        status = "fail"
+        detail = "docker binary not found; mle jobs will not start without Docker"
+    checks.append(PaperDoctorCheck("docker", status, detail))
+    image_profile_path = resolved_image_profile_path()
+    if image_profile_path.exists():
+        checks.append(
+            PaperDoctorCheck(
+                "runtime_image_config",
+                "ok",
+                f"Using {image_profile_path}",
+            )
+        )
+    else:
+        checks.append(
+            PaperDoctorCheck(
+                "runtime_image_config",
+                "fail",
+                f"Missing runtime image config file: {image_profile_path}",
+            )
+        )
+    try:
+        runtime_image = resolve_image_profile(None, default_for="mle")
+    except Exception as exc:  # noqa: BLE001
+        checks.append(PaperDoctorCheck("runtime_image", "fail", str(exc)))
+    else:
+        checks.append(
+            PaperDoctorCheck(
+                "runtime_image",
+                "ok",
+                f"profile={runtime_image.name} image={runtime_image.image} pull_policy={runtime_image.pull_policy.value}",
+            )
+        )
+    checks.append(
+        PaperDoctorCheck(
+            "proxy_env",
+            "ok" if proxy_enabled() else "warn",
+            (
+                "Proxy environment is present"
+                if proxy_enabled()
+                else "No proxy environment detected; runs that need cache preparation or image pulls will be blocked until the operator runs proxy-on first."
+            ),
+        )
+    )
+    for warning in preflight_doctor_warnings():
+        checks.append(PaperDoctorCheck("network_preflight", "warn", warning))
+    requested_profile = os.environ.get("AISCI_MLE_DOCTOR_PROFILE")
+    profile_path = _resolved_mle_profile_path()
+    if profile_path.exists():
+        checks.append(
+            PaperDoctorCheck(
+                "llm_config",
+                "ok",
+                f"Using {profile_path}",
+            )
+        )
+    else:
+        checks.append(
+            PaperDoctorCheck(
+                "llm_config",
+                "fail",
+                f"Missing MLE LLM config file: {profile_path}",
+            )
+        )
+    try:
+        profile = resolve_llm_profile(
+            requested_profile,
+            default_for="mle",
+            profile_file=str(profile_path),
+        )
+    except Exception as exc:  # noqa: BLE001
+        checks.append(PaperDoctorCheck("llm_profile", "fail", str(exc)))
+        checks.append(
+            PaperDoctorCheck(
+                "api_key",
+                "fail",
+                "LLM profile could not be resolved, so backend credentials could not be checked.",
+            )
+        )
+    else:
+        profile_name = requested_profile or profile.name
+        checks.append(
+            PaperDoctorCheck(
+                "llm_profile",
+                "ok",
+                f"name={profile_name} backend={profile.backend_name} provider={profile.provider} model={profile.model} api_mode={profile.api_mode}",
+            )
+        )
+        missing_env = missing_backend_env_vars(profile)
+        checks.append(
+            PaperDoctorCheck(
+                "api_key",
+                "ok" if not missing_env else "fail",
+                (
+                    "Backend credentials detected"
+                    if not missing_env
+                    else f"Missing backend env vars for profile {profile.name}: {', '.join(missing_env)}"
+                ),
+            )
+        )
+    checks.append(
+        PaperDoctorCheck(
+            "mle console",
+            "ok",
+            "CLI: aisci mle run / doctor / validate / resume; Web: /mle/jobs and /jobs/<id>. MLE orchestrates on the host and uses Docker only for the sandbox workspace.",
+        )
+    )
+    return checks
+
+
 def paper_job_summary(job: JobRecord, validation: dict[str, Any] | None = None) -> dict[str, Any]:
     job_paths = resolve_job_paths(job.id)
     workspace_root = job_paths.workspace_dir
+    capabilities = paper_capability_flags(job)
+    log_targets = [target.__dict__ for target in paper_log_targets(job)]
+    artifact_hints = [hint.__dict__ for hint in paper_artifact_hints(job)]
     artifact_paths = []
     for candidate in (
         job_paths.artifacts_dir / "validation_report.json",
@@ -495,22 +802,91 @@ def paper_job_summary(job: JobRecord, validation: dict[str, Any] | None = None) 
         "workspace_root": str(workspace_root),
         "artifacts": artifact_paths,
         "validation": validation or {},
-        "paper_capabilities": paper_capability_flags(job),
-        "paper_log_targets": [target.__dict__ for target in paper_log_targets(job)],
-        "paper_artifacts": [hint.__dict__ for hint in paper_artifact_hints(job)],
+        "type_subtitle": "paper job console",
+        "mode_detail": "Research: online" if getattr(job.mode_spec, "enable_online_research", False) else "Research: offline",
+        "controls_title": "Paper controls",
+        "controls_badge": "product view",
+        "artifact_title": "Paper artifacts",
+        "validation_title": "Validation / Self-check",
+        "validation_action_label": "Run self-check",
+        "validation_empty": "No final self-check artifact has been produced yet. Use the self-check action above or inspect the job status once the run completes.",
+        "helpful_logs_hint": f"Use `aisci logs list {job.id}` or `aisci logs tail {job.id} --kind conversation` to inspect the run from the terminal.",
+        "capability_flags": capabilities,
+        "log_targets": log_targets,
+        "artifact_hints": artifact_hints,
+        "paper_capabilities": capabilities,
+        "paper_log_targets": log_targets,
+        "paper_artifacts": artifact_hints,
+    }
+
+
+def mle_job_summary(job: JobRecord, validation: dict[str, Any] | None = None) -> dict[str, Any]:
+    job_paths = resolve_job_paths(job.id)
+    workspace_root = job_paths.workspace_dir
+    capabilities = mle_capability_flags(job)
+    log_targets = [target.__dict__ for target in mle_log_targets(job)]
+    artifact_hints = [hint.__dict__ for hint in mle_artifact_hints(job)]
+    artifact_paths = []
+    for candidate in (
+        job_paths.artifacts_dir / "validation_report.json",
+        job_paths.artifacts_dir / "champion_report.md",
+        job_paths.state_dir / "sandbox_session.json",
+        job_paths.state_dir / "resolved_llm_config.json",
+        job_paths.workspace_dir / "submission" / "submission_registry.jsonl",
+        job_paths.logs_dir / "job.log",
+    ):
+        if candidate.exists():
+            artifact_paths.append(str(candidate))
+    return {
+        "id": job.id,
+        "job_type": job.job_type.value,
+        "status": job.status.value,
+        "phase": job.phase.value,
+        "objective": job.objective,
+        "llm_profile": job.llm_profile,
+        "workspace_root": str(workspace_root),
+        "artifacts": artifact_paths,
+        "validation": validation or {},
+        "type_subtitle": "mle job console",
+        "mode_detail": f"Input: {_mle_input_mode(job)}",
+        "controls_title": "MLE controls",
+        "controls_badge": "runtime view",
+        "artifact_title": "MLE artifacts",
+        "validation_title": "Validation",
+        "validation_action_label": "Run validation",
+        "validation_empty": "No final validation artifact has been produced yet. Use the validation action above or inspect the job status once the run completes.",
+        "helpful_logs_hint": f"Use `aisci logs list {job.id}` or `aisci logs tail {job.id} --kind agent` to inspect the run from the terminal.",
+        "capability_flags": capabilities,
+        "log_targets": log_targets,
+        "artifact_hints": artifact_hints,
+        "mle_capabilities": capabilities,
+        "mle_log_targets": log_targets,
+        "mle_artifacts": artifact_hints,
     }
 
 
 def job_console_summary(job: JobRecord, *, validation: dict[str, Any] | None = None) -> dict[str, Any]:
     job_paths = resolve_job_paths(job.id)
     tree_root = job_paths.root
-    summary = paper_job_summary(job, validation=validation)
+    if job.job_type == JobType.MLE:
+        summary = mle_job_summary(job, validation=validation)
+        summary["log_targets"] = mle_log_targets(job)
+        summary["artifact_hints"] = mle_artifact_hints(job)
+        summary["capability_flags"] = mle_capability_flags(job)
+        summary["mle_log_targets"] = summary["log_targets"]
+        summary["mle_artifacts"] = summary["artifact_hints"]
+        summary["mle_capabilities"] = summary["capability_flags"]
+    else:
+        summary = paper_job_summary(job, validation=validation)
+        summary["log_targets"] = paper_log_targets(job)
+        summary["artifact_hints"] = paper_artifact_hints(job)
+        summary["capability_flags"] = paper_capability_flags(job)
+        summary["paper_log_targets"] = summary["log_targets"]
+        summary["paper_artifacts"] = summary["artifact_hints"]
+        summary["paper_capabilities"] = summary["capability_flags"]
     summary["tree"] = list_text_tree(tree_root, max_depth=4, max_entries=300)
     summary["tree_root"] = str(tree_root)
     summary["workspace_tree"] = list_text_tree(job_paths.workspace_dir, max_depth=4, max_entries=200)
     summary["log_tree"] = list_text_tree(job_paths.logs_dir, max_depth=2, max_entries=50)
     summary["artifact_tree"] = list_text_tree(job_paths.artifacts_dir, max_depth=3, max_entries=150)
-    summary["paper_log_targets"] = paper_log_targets(job)
-    summary["paper_artifacts"] = paper_artifact_hints(job)
-    summary["paper_capabilities"] = paper_capability_flags(job)
     return summary

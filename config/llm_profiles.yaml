@@ -3,7 +3,7 @@ version: 1
 defaults:
   default: glm-5
   paper: glm-5
-  mle: glm-5
+  mle: gpt-5.4
 
 backends:
   openai:
@@ -52,3 +52,15 @@ profiles:
       context_window: 202752
     features:
       clear_thinking: true
+
+  gemini-3-flash:
+    backend: openai
+    model: gemini-3-flash-preview
+    api: completions
+    limits:
+      max_completion_tokens: 20480
+      context_window: 1000000
+    reasoning:
+      effort: high
+    sampling:
+      temperature: 1.0

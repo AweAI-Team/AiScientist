@@ -10,6 +10,7 @@ Allows the main agent to spawn generic subagents for various tasks:
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import time
 
 import structlog
@@ -28,6 +29,22 @@ from aisci_agent_runtime.tools.base import Tool
 logger = structlog.stdlib.get_logger(component=__name__)
 
 LOGS_DIR = os.environ.get("LOGS_DIR", "/home/logs")
+
+
+def _logs_dir() -> str:
+    return os.environ.get("LOGS_DIR", LOGS_DIR)
+
+
+def _mapped_log_dir(shell: ShellInterface | None, path: str) -> Path:
+    mapper = getattr(shell, "mapped", None)
+    if callable(mapper):
+        try:
+            mapped = mapper(path)
+        except Exception:
+            mapped = None
+        if mapped is not None:
+            return Path(mapped)
+    return Path(path)
 
 _TYPE_CONFIGS = {
     "explore": DEFAULT_EXPLORE_SUBAGENT_CONFIG,
@@ -127,14 +144,15 @@ class SpawnSubagentTool(Tool):
 
         self._session_counter += 1
         ts = time.strftime("%Y%m%d_%H%M%S")
-        session_dir = f"{LOGS_DIR}/subagent_logs/generic_{subagent_type}_{self._session_counter:03d}_{ts}"
-        os.makedirs(session_dir, exist_ok=True)
+        session_dir = f"{_logs_dir()}/subagent_logs/generic_{subagent_type}_{self._session_counter:03d}_{ts}"
+        local_session_dir = _mapped_log_dir(self._shell, session_dir)
+        os.makedirs(local_session_dir, exist_ok=True)
 
         config_with_log = SubagentConfig(
             max_steps=config.max_steps,
             time_limit=config.time_limit,
             reminder_freq=config.reminder_freq,
-            log_dir=session_dir,
+            log_dir=str(local_session_dir),
         )
 
         subagent_class = _TYPE_CLASSES[subagent_type]

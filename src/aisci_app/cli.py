@@ -13,18 +13,21 @@ from aisci_app.presentation import (
     build_job_spec_clone,
     build_mle_job_spec,
     build_paper_job_spec,
+    default_mle_llm_profile_name,
+    mle_doctor_report,
     paper_doctor_report,
 )
-from aisci_app.tui import run_tui_dashboard
+from aisci_app.tui import run_mle_launcher, run_tui_dashboard
 from aisci_agent_runtime.llm_profiles import default_llm_profile_name
 from aisci_core.models import JobStatus, PullPolicy
 from aisci_core.env_config import load_runtime_env
 from aisci_core.paths import ensure_job_dirs, resolve_job_paths
 from aisci_core.store import JobStore
+from aisci_domain_mle.preflight import evaluate_mle_launch_preflight
 
 app = typer.Typer(help="AI Scientist Workbench")
 paper_app = typer.Typer(help="paper mode")
-mle_app = typer.Typer(help="mle mode")
+mle_app = typer.Typer(help="mle mode", invoke_without_command=True, no_args_is_help=False)
 jobs_app = typer.Typer(help="inspect jobs")
 logs_app = typer.Typer(help="inspect logs")
 artifacts_app = typer.Typer(help="inspect artifacts")
@@ -54,10 +57,28 @@ def main(
             help="Write jobs/, export/, and .aisci state under this directory for this invocation.",
         ),
     ] = None,
+    llm_profile_file: Annotated[
+        str | None,
+        typer.Option(
+            "--llm-profile-file",
+            help="Override the shared LLM profile registry file for this invocation.",
+        ),
+    ] = None,
+    image_profile_file: Annotated[
+        str | None,
+        typer.Option(
+            "--image-profile-file",
+            help="Override the shared Docker image profile registry file for this invocation.",
+        ),
+    ] = None,
 ) -> None:
     load_runtime_env(env_file)
     if output_root:
         os.environ["AISCI_OUTPUT_ROOT"] = str(Path(output_root).expanduser().resolve())
+    if llm_profile_file:
+        os.environ["AISCI_LLM_PROFILE_FILE"] = str(Path(llm_profile_file).expanduser().resolve())
+    if image_profile_file:
+        os.environ["AISCI_IMAGE_PROFILE_FILE"] = str(Path(image_profile_file).expanduser().resolve())
 
 
 def _print_json(payload: object) -> None:
@@ -108,6 +129,17 @@ def _emit_job_launch_result(
     _print_json(payload)
     if worker_value != 0 or job.status != JobStatus.SUCCEEDED:
         raise typer.Exit(code=1)
+
+
+def _ensure_mle_launch_ready(spec) -> None:
+    preflight = evaluate_mle_launch_preflight(spec)
+    if preflight.ready:
+        return
+    for warning in preflight.warnings:
+        typer.echo(f"[warn] {warning}", err=True)
+    for error in preflight.errors:
+        typer.echo(error, err=True)
+    raise typer.Exit(code=2)
 
 
 def _is_interactive_terminal() -> bool:
@@ -331,6 +363,16 @@ def paper_resume(
 
 @mle_app.command("run")
 def run_mle(
+    ctx: typer.Context,
+    competition_name: Annotated[str | None, typer.Option("--name")] = None,
+    competition_zip_path: Annotated[str | None, typer.Option("--zip")] = None,
+    mlebench_data_dir: Annotated[
+        str | None,
+        typer.Option(
+            "--mlebench-data-dir",
+            help="Prepared MLE-Bench cache root. Defaults to ~/.cache/mle-bench/data when omitted.",
+        ),
+    ] = None,
     workspace_zip: Annotated[str | None, typer.Option("--workspace-zip")] = None,
     competition_bundle_zip: Annotated[str | None, typer.Option("--competition-bundle-zip")] = None,
     data_dir: Annotated[str | None, typer.Option("--data-dir")] = None,
@@ -355,15 +397,35 @@ def run_mle(
         PullPolicy | None,
         typer.Option("--pull-policy", help="Image pull policy: if-missing, always, or never."),
     ] = None,
-    run_final_validation: Annotated[bool, typer.Option("--run-final-validation")] = False,
+    run_final_validation: Annotated[
+        bool,
+        typer.Option("--run-final-validation/--skip-final-validation"),
+    ] = False,
     detach: Annotated[bool, typer.Option("--detach/--wait")] = True,
+    tui: Annotated[
+        bool,
+        typer.Option(
+            "--tui",
+            help="Attach the live terminal dashboard after starting the job. Requires --wait and an interactive terminal.",
+        ),
+    ] = False,
 ) -> None:
     service = JobService()
-    selected_llm_profile = llm_profile or default_llm_profile_name("mle")
+    selected_llm_profile = llm_profile or default_mle_llm_profile_name()
     gpu_ids = _parse_gpu_ids(gpu_ids_raw)
+    inherited_tui = bool(getattr(getattr(ctx, "parent", None), "params", {}).get("tui"))
+    effective_tui = tui or inherited_tui
+    wait = not detach or inherited_tui
     if gpu_ids and gpus > 0:
         raise typer.BadParameter("Use either --gpus <count> or --gpu-ids <id,id>, not both.")
+    if effective_tui and wait is False:
+        raise typer.BadParameter("--tui requires --wait.")
+    if effective_tui and not _is_interactive_terminal():
+        raise typer.BadParameter("--tui requires an interactive terminal.")
     spec = build_mle_job_spec(
+        competition_name=competition_name,
+        competition_zip_path=competition_zip_path,
+        mlebench_data_dir=mlebench_data_dir,
         workspace_zip=workspace_zip,
         competition_bundle_zip=competition_bundle_zip,
         data_dir=data_dir,
@@ -381,10 +443,117 @@ def run_mle(
         pull_policy=pull_policy,
         run_final_validation=run_final_validation,
     )
+    _ensure_mle_launch_ready(spec)
     job = service.create_job(spec)
-    wait = not detach
+    if effective_tui:
+        worker_pid = service.spawn_worker(job.id, wait=False)
+        result = _run_tui_or_exit(
+            job_id=job.id,
+            refresh_seconds=2.0,
+            once=False,
+            exit_when_job_done=True,
+            store=service.store,
+        )
+        if result.detached:
+            _emit_job_launch_result(service, job.id, worker_pid, wait=False)
+            return
+        final_job = service.store.get_job(job.id)
+        if final_job.status != JobStatus.SUCCEEDED:
+            raise typer.Exit(code=1)
+        return
     worker_value = service.spawn_worker(job.id, wait=wait)
     _emit_job_launch_result(service, job.id, worker_value, wait=wait)
+
+
+@mle_app.callback()
+def mle_root(
+    ctx: typer.Context,
+    tui: Annotated[
+        bool,
+        typer.Option(
+            "--tui",
+            help="Open the interactive MLE launcher and attach the live dashboard after starting a job.",
+        ),
+    ] = False,
+) -> None:
+    if ctx.invoked_subcommand is not None:
+        if tui and ctx.invoked_subcommand != "run":
+            raise typer.BadParameter(
+                "--tui on `aisci mle` is only supported with `run` or with no subcommand. "
+                "Use `aisci mle run ... --wait --tui` or `aisci mle --tui`."
+            )
+        return
+    if tui:
+        if not _is_interactive_terminal():
+            raise typer.BadParameter("--tui requires an interactive terminal.")
+        store = JobStore()
+        result = run_mle_launcher(store=store)
+        if result is None or result.job_id is None:
+            return
+        if result.detached:
+            return
+        final_job = store.get_job(result.job_id)
+        if final_job.status != JobStatus.SUCCEEDED:
+            raise typer.Exit(code=1)
+        return
+    typer.echo(ctx.get_help())
+    raise typer.Exit()
+
+
+@mle_app.command("doctor")
+def mle_doctor(json_output: Annotated[bool, typer.Option("--json/--text")] = False) -> None:
+    checks = mle_doctor_report()
+    if json_output:
+        _print_json([check.__dict__ for check in checks])
+        return
+    typer.echo("MLE Doctor")
+    for check in checks:
+        typer.echo(f"- {check.name}: {check.status} ({check.detail})")
+    typer.echo("")
+    typer.echo("Start an MLE job with:")
+    typer.echo("  aisci mle run --name detecting-insults-in-social-commentary")
+
+
+@mle_app.command("validate")
+def mle_validate(
+    job_id: str,
+    detach: Annotated[bool, typer.Option("--detach/--wait")] = True,
+) -> None:
+    job = _get_job_or_exit(job_id)
+    spec = build_job_spec_clone(job, objective_suffix=" [self-check]", run_final_validation=True)
+    _ensure_mle_launch_ready(spec)
+    service = JobService()
+    new_job = service.create_job(spec)
+    wait = not detach
+    worker_value = service.spawn_worker(new_job.id, wait=wait)
+    _emit_job_launch_result(
+        service,
+        new_job.id,
+        worker_value,
+        wait=wait,
+        extra={"source_job_id": job_id, "mode": "self-check"},
+    )
+
+
+@mle_app.command("resume")
+def mle_resume(
+    job_id: str,
+    detach: Annotated[bool, typer.Option("--detach/--wait")] = True,
+) -> None:
+    job = _get_job_or_exit(job_id)
+    spec = build_job_spec_clone(job, objective_suffix=" [resumed]")
+    _ensure_mle_launch_ready(spec)
+    service = JobService()
+    new_job = service.create_job(spec)
+    wait = not detach
+    worker_value = service.spawn_worker(new_job.id, wait=wait)
+    _emit_job_launch_result(
+        service,
+        new_job.id,
+        worker_value,
+        wait=wait,
+        extra={"source_job_id": job_id, "mode": "resume"},
+    )
 
 
 @jobs_app.command("list")

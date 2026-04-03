@@ -22,18 +22,28 @@ class JobService:
 
     def spawn_worker(self, job_id: str, wait: bool = False) -> int:
         command = [sys.executable, "-m", "aisci_app.worker_main", job_id]
+        paths = ensure_job_dirs(resolve_job_paths(job_id))
+        worker_log = paths.logs_dir / "worker.log"
+        worker_log.parent.mkdir(parents=True, exist_ok=True)
         if wait:
-            completed = subprocess.run(command, check=False)
+            with worker_log.open("ab") as handle:
+                completed = subprocess.run(
+                    command,
+                    check=False,
+                    stdout=handle,
+                    stderr=handle,
+                )
             return completed.returncode
+        handle = worker_log.open("ab")
         process = subprocess.Popen(
             command,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=handle,
+            stderr=handle,
             env=os.environ.copy(),
         )
+        handle.close()
         return process.pid
 
     def export_bundle(self, job_id: str) -> Path:
         paths = ensure_job_dirs(resolve_job_paths(job_id))
         return export_job_bundle(paths, paths.export_dir / f"{job_id}.zip")
-
