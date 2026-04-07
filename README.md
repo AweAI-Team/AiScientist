@@ -33,6 +33,12 @@
   <em>Across a 24-hour autonomous run, AiScientist repeatedly implements, tests, keeps, and discards candidate ideas while pushing the running best upward. This trajectory shows long-horizon improvement through 78 experiment cycles, with diverse solution strategies explored along the way rather than a single lucky guess.</em>
 </p>
 
+## 📰 News
+
+- `2026-04-09`: Initial public release of AiScientist.
+- `2026-04-09`: The public README now reflects the `File-as-Bus` thesis, hierarchical research team design, and long-horizon paper/MLE workflows.
+- Future updates will include benchmarks, release notes, and project milestones.
+
 ## 🔬 What AiScientist Is
 
 AiScientist is an artifact-mediated virtual research lab for long-horizon ML research engineering. It keeps orchestration lightweight while preserving the evolving state of the project in a shared workspace that every downstream agent can re-ground on.
