@@ -3,19 +3,19 @@
 <p align="center">
   <strong>Long-horizon ML research needs File-as-Bus coordination, not just message handoffs.</strong><br />
   <em><strong>Talk is cheap</strong>, show me <strong>your files</strong>.</em><br />
-  Hierarchical Orchestration | File-as-Bus Coordination | Thin Control over Thick State
+  <!-- Hierarchical Orchestration | File-as-Bus Coordination | Thin Control over Thick State -->
 </p>
 
 <p align="center">
-  <a href="#quick-start"><img src="https://img.shields.io/badge/Quick_Start-Local_Setup-0F766E?style=for-the-badge" alt="Quick Start" /></a>
-  <a href="#why-it-feels-different"><img src="https://img.shields.io/badge/Why-File--as--Bus-111827?style=for-the-badge" alt="Why File-as-Bus" /></a>
-  <a href="#paper-track"><img src="https://img.shields.io/badge/Paper_Bench-Top--tier_Conference_Paper-D86A42?style=for-the-badge" alt="Paper Track" /></a>
-  <a href="#mle-track"><img src="https://img.shields.io/badge/MLE_Bench-Top--tier_Competition--style_ML_tasks-F59E0B?style=for-the-badge" alt="MLE Track" /></a>
-  <a href="#what-lands-on-disk"><img src="https://img.shields.io/badge/Inspectability-Workspace_State-10233F?style=for-the-badge" alt="Workspace State" /></a>
+  <a href="#🚀-quick-start"><img src="https://img.shields.io/badge/Quick_Start-0F766E?style=for-the-badge" alt="Quick Start" /></a>
+  <a href="#✨-why-it-feels-different"><img src="https://img.shields.io/badge/Why_File--as--Bus-111827?style=for-the-badge" alt="Why File-as-Bus" /></a>
+  <a href="#paper-track"><img src="https://img.shields.io/badge/Paper_Bench-D86A42?style=for-the-badge" alt="Paper Track" /></a>
+  <a href="#mle-track"><img src="https://img.shields.io/badge/MLE_Bench-10233F?style=for-the-badge" alt="MLE Track" /></a>
+  <a href="#💾-what-lands-on-disk"><img src="https://img.shields.io/badge/Workspace_State-F59E0B?style=for-the-badge" alt="Workspace State" /></a>
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/hierarchical_orchestration-Agent--as--Tool-0F766E" alt="Agent-as-Tool orchestration" />
+  <img src="https://img.shields.io/badge/orchestration-hierarchical_research_team-0F766E" alt="Agent-as-Tool orchestration" />
   <img src="https://img.shields.io/badge/coordination-File--as--Bus-10233F" alt="File-as-Bus coordination" />
   <img src="https://img.shields.io/badge/control-Thin_over_Thick_State-D86A42" alt="Thin control over thick state" />
   <img src="https://img.shields.io/badge/state-System_of_Record-F59E0B" alt="System of record" />
@@ -96,9 +96,15 @@ File-as-Bus is the core coordination protocol. Instead of compressing progress i
 
 <p align="center"><em>A short look at AiScientist in motion.</em></p>
 
+<table align="center" width="82%">
+<tr>
+<td align="center">
+
 https://github.com/user-attachments/assets/4356691b-eeb5-4766-a50b-29ddbc48ef9b
 
-<p align="center"><em>Hierarchical orchestration, File-as-Bus coordination, and durable workspace state in one run.</em></p>
+</td>
+</tr>
+</table>
 
 ---
 
