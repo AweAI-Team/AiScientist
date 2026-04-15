@@ -441,6 +441,40 @@ def test_format_recent_event_text_separates_step_from_summary_without_phase() ->
     assert any(span.style == "bright_white" for span in rendered.spans)
 
 
+def test_format_recent_event_text_summarizes_prioritize_tool_results() -> None:
+    rendered = _format_recent_event_text(
+        {
+            "event_type": "tool_result",
+            "step": 5,
+            "phase": "prioritize",
+            "tool": "prioritize_tasks",
+            "result_preview": (
+                "[Prioritization ✓] (4 steps, 169.5s)\n\n"
+                "**Prioritized tasks saved to**: `/tmp/prioritized_tasks.md`\n\n"
+                "**Key Findings:**\n"
+                "- **10 P0 tasks** (70% of score)\n"
+                "- **3 P1 tasks** (20%)\n"
+                "- **3 P2 tasks** (8%)\n"
+            ),
+        }
+    )
+
+    assert rendered.plain == "step 5  [prioritize]  prioritize_tasks: saved prioritized_tasks.md; 10 P0 / 3 P1 / 3 P2"
+
+
+def test_format_recent_event_text_summarizes_missing_read_file_chunk() -> None:
+    rendered = _format_recent_event_text(
+        {
+            "event_type": "tool_result",
+            "step": 4,
+            "tool": "read_file_chunk",
+            "result_preview": "File not found: /home/paper/rubric.json. It may be optional or not staged for this run.",
+        }
+    )
+
+    assert rendered.plain == "step 4  read_file_chunk: File not found: rubric.json. It may be optional or not staged for this run."
+
+
 def test_recent_feed_prefers_operational_events_over_agent_transcript() -> None:
     records = [
         {"event_type": "model_response", "phase": "implement", "text": "I will inspect the implementation details."},
@@ -487,6 +521,47 @@ def test_render_recent_events_truncates_from_top() -> None:
     assert "first started" not in text
     assert "second finished" not in text
     assert text.index("third finished") < text.index("fourth finished")
+
+
+def test_render_recent_events_reserves_space_for_latest_short_events() -> None:
+    console = Console(width=70, record=True, force_terminal=False)
+    renderable = _render_recent_events(
+        [
+            {
+                "event_type": "tool_result",
+                "step": 5,
+                "phase": "prioritize",
+                "tool": "prioritize_tasks",
+                "result_preview": (
+                    "[Prioritization ✓] (4 steps, 169.5s)\n\n"
+                    "**Prioritized tasks saved to**: `/tmp/prioritized_tasks.md`\n\n"
+                    "**Key Findings:**\n"
+                    "- **10 P0 tasks** (70% of score)\n"
+                    "- **3 P1 tasks** (20%)\n"
+                    "- **3 P2 tasks** (8%)\n"
+                ),
+            },
+            {
+                "event_type": "model_response",
+                "step": 7,
+                "phase": "implement",
+                "text": "Let me start the implementation.",
+            },
+            {
+                "event_type": "subagent_start",
+                "phase": "implement",
+                "message": "implementation subagent started.",
+            },
+        ],
+        max_lines=6,
+        width=44,
+    )
+    console.print(renderable)
+    text = console.export_text()
+
+    assert "step 5  [prioritize]  prioritize_tasks:" in text
+    assert "step 7  [implement]" in text
+    assert "implementation subagent star..." in text
 
 
 def test_cli_global_env_file_option_loads_api_key(tmp_path: Path, monkeypatch) -> None:

@@ -15,6 +15,7 @@ import re
 from typing import Any
 
 from rich import box
+from rich.cells import cell_len
 from rich.columns import Columns
 from rich.console import Console, Group, RenderableType
 from rich.layout import Layout
@@ -1222,7 +1223,11 @@ class _DashboardApp:
         artifact_lines = max(artifact_height - 2, 3)
         event_lines = max(events_height - 2, 3)
         records = _recent_events(detail.row.job, limit=max(event_lines * 2, EVENT_LIMIT))
-        body = _render_recent_events(records, max_items=event_lines)
+        body = _render_recent_events(
+            records,
+            max_lines=event_lines,
+            width=_events_panel_content_width(self.console.size.width),
+        )
         artifacts_panel = Panel(
             Text(_truncate_block_lines(detail.artifact_tree, max_lines=artifact_lines), style="bright_black"),
             title="Artifacts",
@@ -1521,6 +1526,12 @@ def _latest_phase(path: Path, *, fallback: str) -> str:
     return fallback
 
 
+def _events_panel_content_width(console_width: int) -> int:
+    if console_width >= 140:
+        return max((console_width * 2) // 3 - 8, 32)
+    return max(console_width - 6, 24)
+
+
 def _summarize_record(record: dict[str, Any]) -> str:
     message = _string_value(record.get("message"))
     if message:
@@ -1543,9 +1554,69 @@ def _summarize_record(record: dict[str, Any]) -> str:
     if event_kind == "tool_result":
         tool = _string_value(record.get("tool")) or "tool"
         preview = _string_value(record.get("result_preview"))
-        summary = _compact_text(preview) if preview else "completed"
-        return f"{tool}: {_crop(summary, 180)}"
+        return _summarize_tool_result(tool, preview)
     return _crop(event_kind, 180)
+
+
+def _summarize_tool_result(tool: str, preview: str | None) -> str:
+    if not preview:
+        return f"{tool}: completed"
+    if tool == "read_file_chunk":
+        return f"{tool}: {_summarize_read_file_chunk_preview(preview)}"
+    if tool == "prioritize_tasks":
+        return f"{tool}: {_summarize_prioritize_preview(preview)}"
+    if tool == "read_paper":
+        return f"{tool}: {_summarize_read_paper_preview(preview)}"
+    return f"{tool}: {_crop(_first_preview_excerpt(preview), 120)}"
+
+
+def _summarize_read_file_chunk_preview(preview: str) -> str:
+    compact = _compact_text(preview)
+    if compact.startswith("File not found: "):
+        path_text = compact.removeprefix("File not found: ")
+        raw_path, marker, remainder = path_text.partition(". It may")
+        if marker:
+            return f"File not found: {Path(raw_path).name}. It may{remainder}"
+        return f"File not found: {Path(path_text).name}"
+    return _crop(_first_preview_excerpt(preview), 96)
+
+
+def _summarize_prioritize_preview(preview: str) -> str:
+    pieces: list[str] = []
+    saved_match = re.search(r"saved to\*\*:\s*`([^`]+)`", preview, flags=re.IGNORECASE)
+    if not saved_match:
+        saved_match = re.search(r"saved to\s*`([^`]+)`", preview, flags=re.IGNORECASE)
+    if saved_match:
+        pieces.append(f"saved {Path(saved_match.group(1)).name}")
+    counts = []
+    for label in ("P0", "P1", "P2"):
+        match = re.search(rf"(\d+)\s+{label}\s+tasks", preview)
+        if match:
+            counts.append(f"{match.group(1)} {label}")
+    if counts:
+        pieces.append(" / ".join(counts))
+    if pieces:
+        return "; ".join(pieces)
+    return _crop(_first_preview_excerpt(preview), 96)
+
+
+def _summarize_read_paper_preview(preview: str) -> str:
+    pieces: list[str] = ["paper analysis ready"]
+    saved_match = re.search(r"Summary saved to\s+([^\s`]+)", preview)
+    if saved_match:
+        pieces.append(f"saved {Path(saved_match.group(1)).name}")
+    runtime_match = re.search(r"\*\*Total Runtime\*\*:\s*([^\n*]+)", preview)
+    if runtime_match:
+        pieces.append(runtime_match.group(1).strip())
+    return "; ".join(pieces)
+
+
+def _first_preview_excerpt(preview: str) -> str:
+    for raw_line in preview.splitlines():
+        line = _compact_text(re.sub(r"^\s*\d+\s*\|\s*", "", raw_line))
+        if line:
+            return line
+    return _compact_text(preview) or "completed"
 
 
 def _format_event(record: dict[str, Any]) -> str:
@@ -1564,21 +1635,32 @@ def _format_event(record: dict[str, Any]) -> str:
     return summary
 
 
-def _render_recent_events(records: list[dict[str, Any]], *, max_items: int | None = None) -> RenderableType:
+def _render_recent_events(
+    records: list[dict[str, Any]],
+    *,
+    max_items: int | None = None,
+    max_lines: int | None = None,
+    width: int = 120,
+) -> RenderableType:
     if not records:
         return Text("No events recorded yet.", style="dim")
-    lines = [_format_recent_event_text(record) for record in records]
+    lines = [_format_recent_event_text(record, width=width) for record in records]
     lines = [line for line in lines if line.plain.strip()]
     if not lines:
         return Text("No events recorded yet.", style="dim")
-    if max_items is not None and len(lines) > max_items:
+    if max_lines is not None:
+        if len(lines) > max_lines:
+            if max_lines <= 1:
+                return Text("...", style="dim")
+            lines = [Text("...", style="dim"), *lines[-(max_lines - 1) :]]
+    elif max_items is not None and len(lines) > max_items:
         if max_items <= 1:
             return Text("...", style="dim")
         lines = [Text("...", style="dim"), *lines[-(max_items - 1) :]]
     return Group(*lines)
 
 
-def _format_recent_event_text(record: dict[str, Any]) -> Text:
+def _format_recent_event_text(record: dict[str, Any], *, width: int | None = None) -> Text:
     summary = _summarize_record(record)
     if not summary:
         return Text()
@@ -1593,7 +1675,13 @@ def _format_recent_event_text(record: dict[str, Any]) -> Text:
         line.append(f"[{phase}]", style="magenta")
         line.append("  ")
 
-    line.append(_crop(summary, 180), style=_recent_event_style(record, summary))
+    summary_style = _recent_event_style(record, summary)
+    summary_width = 180
+    if width is not None:
+        summary_width = max(width - cell_len(line.plain), 8)
+    line.append(_crop(summary, summary_width), style=summary_style)
+    if width is not None and cell_len(line.plain) > width:
+        return Text(_crop(line.plain, width), style=summary_style)
     return line
 
 
