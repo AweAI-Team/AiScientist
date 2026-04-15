@@ -1,0 +1,201 @@
+vars:
+  step_count: &step_count 25
+  time_limit: &time_limit 14400 # 4 hrs
+
+defaults: &defaults
+  start: aide/start.sh
+  dockerfile: aide/Dockerfile
+  kwargs_type: omegaconf
+  env_vars: &env_vars
+    TIME_LIMIT_SECS: *time_limit
+    STEP_LIMIT: *step_count
+
+kwargs_common: &kwargs_common
+  agent.search.max_debug_depth: 20 # debug down a branch for up to 20 steps
+  agent.search.debug_prob: 1 # always debug when there's something to debug
+  agent.time_limit: *time_limit
+  exec.timeout: 3600 # 1 hour limit per step
+  copy_data: False # use symbolic links
+
+aide:
+  <<: *defaults
+  kwargs:
+    <<: *kwargs_common
+    agent.code.model: gpt-4o-2024-08-06
+    agent.feedback.model: gpt-4o-2024-08-06
+    agent.steps: *step_count
+  env_vars:
+    <<: *env_vars
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+aide/dev:
+  <<: *defaults
+  kwargs:
+    <<: *kwargs_common
+    agent.code.model: gpt-4o-2024-08-06
+    agent.feedback.model: gpt-4o-2024-08-06
+    agent.steps: 8
+  env_vars:
+    <<: *env_vars
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+aide/o1-preview:
+  <<: *defaults
+  kwargs:
+    <<: *kwargs_common
+    agent.code.model: o1-preview
+    agent.code.temp: 1
+    agent.feedback.model: gpt-4o-2024-08-06
+    agent.steps: *step_count
+    agent.convert_system_to_user: True
+  env_vars:
+    <<: *env_vars
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+aide/gpt-4-turbo:
+  <<: *defaults
+  kwargs:
+    <<: *kwargs_common
+    agent.code.model: gpt-4-turbo-2024-04-09
+    agent.feedback.model: gpt-4-turbo-2024-04-09
+    agent.steps: *step_count
+  env_vars:
+    <<: *env_vars
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+aide/gpt-4-turbo-dev:
+  <<: *defaults
+  kwargs:
+    <<: *kwargs_common
+    agent.code.model: gpt-4-turbo-2024-04-09
+    agent.feedback.model: gpt-4-turbo-2024-04-09
+    agent.steps: 8
+  env_vars:
+    <<: *env_vars
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+aide/gpt-3.5-turbo-0125:
+  <<: *defaults
+  kwargs:
+    <<: *kwargs_common
+    agent.code.model: gpt-3.5-turbo-0125
+    agent.feedback.model: gpt-3.5-turbo-0125
+    agent.steps: *step_count
+  env_vars:
+    <<: *env_vars
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+aide/gpt-3.5-dev:
+  <<: *defaults
+  kwargs:
+    <<: *kwargs_common
+    agent.code.model: gpt-3.5-turbo-0125
+    agent.feedback.model: gpt-3.5-turbo-0125
+    agent.steps: 8
+  env_vars:
+    <<: *env_vars
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+aide/claude-3-5-sonnet:
+  <<: *defaults
+  kwargs:
+    <<: *kwargs_common
+    agent.code.model: claude-3-5-sonnet-20240620
+    agent.feedback.model: gpt-4o-2024-08-06
+    agent.steps: *step_count
+  env_vars:
+    <<: *env_vars
+    ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+aide/llama-3.1-405b-instruct:
+  <<: *defaults
+  kwargs:
+    <<: *kwargs_common
+    agent.code.model: meta-llama/llama-3.1-405b-instruct
+    agent.feedback.model: gpt-4o-2024-08-06
+    agent.steps: *step_count
+  env_vars:
+    <<: *env_vars
+    OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+
+aide/gemini-1.5-pro:
+  <<: *defaults
+  kwargs:
+    <<: *kwargs_common
+    agent.code.model: gemini-1.5-pro-002
+    agent.feedback.model: gpt-4o-2024-08-06
+    agent.steps: *step_count
+  env_vars:
+    <<: *env_vars
+    GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+aide/obfuscated:
+  <<: *defaults
+  kwargs:
+    <<: *kwargs_common
+    agent.code.model: gpt-4o-2024-08-06
+    agent.feedback.model: gpt-4o-2024-08-06
+    agent.steps: *step_count
+    agent.obfuscate: True
+  env_vars:
+    <<: *env_vars
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    OBFUSCATE: "true"
+
+aide/gpt-5.2:
+  <<: *defaults
+  kwargs:
+    <<: *kwargs_common
+    agent.code.model: gpt-5.2-2025-12-11
+    agent.feedback.model: gpt-5.2-2025-12-11
+    agent.steps: *step_count
+  env_vars:
+    <<: *env_vars
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+
+# GLM-5 — Azure OpenAI Chat Completions (same gateway as aisci/glm-5; see agents/aisci/config.yaml).
+# Patched aideml routes ``glm-*`` to backend_openai + AzureOpenAI when AZURE_OPENAI_ENDPOINT is set.
+aide/glm-5:
+  <<: *defaults
+  kwargs:
+    <<: *kwargs_common
+    agent.code.model: glm-5
+    agent.feedback.model: glm-5
+    agent.steps: *step_count
+    # Some GLM gateways reject lone system-role messages (400 invalid messages).
+    # Put the prompt in user role, same pattern as aide/o1-preview.
+    agent.convert_system_to_user: True
+  env_vars:
+    <<: *env_vars
+    AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+    AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+    OPENAI_API_VERSION: ${{ secrets.OPENAI_API_VERSION }}
+    # Align with aisci/glm-5 (CompletionsLLMClient + LLMConfig)
+    AISCI_CLEAR_THINKING: "true"
+    AISCI_MAX_TOKENS: "20480"
+
+# Gemini 3 Flash — OpenAI-compatible endpoint (same URL as aisci/gemini-3-flash).
+# Patched aideml routes ``gemini-3-*`` to backend_openai + OpenAI(base_url=OPENAI_BASE_URL).
+aide/gemini-3-flash:
+  <<: *defaults
+  kwargs:
+    <<: *kwargs_common
+    agent.code.model: gemini-3-flash-preview
+    agent.feedback.model: gemini-3-flash-preview
+    agent.steps: *step_count
+    agent.code.temp: 1.0
+    agent.feedback.temp: 1.0
+    # 默认 24h（秒）；宿主若 export TIME_LIMIT_SECS=…，run_agent.py 会同步覆盖 agent.time_limit（见 run_in_container）。
+    agent.time_limit: 86400
+    # Gemini OpenAI-compat: system-only turns map to empty GenerateContentRequest.contents → 400.
+    # Same pattern as aide/glm-5 and aide/o1-preview; aisci builds user-role prompts in CompletionsLLMClient.
+    agent.convert_system_to_user: True
+  env_vars:
+    <<: *env_vars
+    TIME_LIMIT_SECS: 86400 # 默认占位；宿主若设置 TIME_LIMIT_SECS，run_agent 会覆盖并同步 agent.time_limit
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    OPENAI_BASE_URL: "https://generativelanguage.googleapis.com/v1beta/openai/"
+    AISCI_REASONING_EFFORT: "high"
+    AISCI_TEMPERATURE: "1.0"
+    AISCI_MAX_TOKENS: "20480"

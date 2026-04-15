@@ -1,0 +1,8 @@
+{
+    "mem_limit": null,
+    "shm_size": "16G",
+    "nano_cpus": 16000000000,
+    "runtime": "nvidia",
+    "gpus": 1,
+    "network_mode": "host"
+}

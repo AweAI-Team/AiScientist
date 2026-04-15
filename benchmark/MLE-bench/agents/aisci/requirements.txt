@@ -1,0 +1,5 @@
+openai>=1.66.0
+structlog>=24.0.0
+pandas>=2.0.0
+scikit-learn>=1.0.0
+tiktoken>=0.7.0

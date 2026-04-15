@@ -1,0 +1,464 @@
+vars:
+  time_limit: &time_limit 86400
+
+defaults: &defaults
+  start: aisci/start.sh
+  dockerfile: aisci/Dockerfile
+  kwargs_type: argparse
+
+# HTTP_PROXY / HTTPS_PROXY default to empty strings so the keys are always passed into the
+# container; set real values in the host environment before run_agent.py if you use a proxy.
+
+# =============================================================================
+# Context window values — design notes
+# =============================================================================
+#
+# AISCI_CONTEXT_WINDOW is the tiktoken-estimated token budget for the input side.
+# It controls when prune_messages() triggers (before the API call hits a hard error).
+#
+# For GPT models the tiktoken (o200k_base / cl100k_base) tokenizer closely matches
+# the model's actual tokenizer, so:
+#   CONTEXT_WINDOW = total_context - MAX_TOKENS  (no correction needed)
+#
+# For GLM models the tokenizer differs: GLM's actual token count is ~1.26x higher
+# than tiktoken's estimate for the same text (measured empirically on GLM workloads:
+# tiktoken 184171 → GLM-5 actual ≈ 184172 × 1.26). This means a tiktoken-based
+# window of 182272 would silently overflow the real 182272-token hard limit.
+#
+# Correction: CONTEXT_WINDOW = (total_context - MAX_TOKENS) / 1.26 - 5000 (safety buffer)
+#   GLM-5:  (202752 - 20480) / 1.26 - 5000 ≈ 139660
+#   GLM-4.7:(200000 - 32768) / 1.26 - 5000 ≈ 127700
+#
+# The - 5000 leaves ~5K tiktoken tokens (~6.3K GLM tokens) as additional margin
+# so a single large tool response won't tip the prune threshold into the hard limit.
+#
+# =============================================================================
+# GPT models
+# =============================================================================
+
+# GPT — Chat Completions API (backward compatible, no web search / reasoning)
+# Context: 400000 total; MAX_TOKENS=32768 output; CONTEXT_WINDOW=367232 input prune threshold
+# GPT tokenizer ≈ tiktoken, no correction needed.
+aisci/gpt-5.2:
+  <<: *defaults
+  env_vars:
+    TIME_LIMIT_SECS: *time_limit
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+    AISCI_MODEL: "gpt-5.2-2025-12-11"
+    AISCI_API_MODE: "completions"
+    AISCI_MAX_TOKENS: "32768"
+    AISCI_CONTEXT_WINDOW: "367232"
+    AISCI_MAX_STEPS: "500"
+    AISCI_IMPL_TIME: "28800"
+    AISCI_EXP_TIME: "14400"
+    AISCI_CONFIG_PROFILE: "default"
+    AISCI_REMINDER_FREQ: "5"
+    HTTP_PROXY: ""
+    HTTPS_PROXY: ""
+    http_proxy: ""
+    https_proxy: ""
+    NO_PROXY: "localhost,127.0.0.1,::1"
+    no_proxy: "localhost,127.0.0.1,::1"
+    HF_ENDPOINT: "https://huggingface.co"
+
+# GPT — Responses API (web_search_preview + reasoning)
+# Context: 400000 total; MAX_TOKENS=32768 output (=1024*32 max response cap)
+# CONTEXT_WINDOW = 400000 - 32768 = 367232 (input prune threshold; GPT tokenizer ≈ tiktoken)
+aisci/gpt-5.2-responses:
+  <<: *defaults
+  env_vars:
+    TIME_LIMIT_SECS: *time_limit
+    AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+    AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+    OPENAI_API_VERSION: ${{ secrets.OPENAI_API_VERSION }}
+    AISCI_MODEL: "gpt-5.2-2025-12-11"
+    AISCI_API_MODE: "responses"
+    AISCI_WEB_SEARCH: "true"
+    AISCI_REASONING_EFFORT: "high"
+    AISCI_REASONING_SUMMARY: "auto"
+    AISCI_MAX_TOKENS: "32768"
+    AISCI_CONTEXT_WINDOW: "367232"
+    AISCI_MAX_STEPS: "500"
+    AISCI_IMPL_TIME: "28800"
+    AISCI_EXP_TIME: "14400"
+    AISCI_CONFIG_PROFILE: "default"
+    AISCI_REMINDER_FREQ: "5"
+    HTTP_PROXY: ""
+    HTTPS_PROXY: ""
+    http_proxy: ""
+    https_proxy: ""
+    NO_PROXY: "localhost,127.0.0.1,::1"
+    no_proxy: "localhost,127.0.0.1,::1"
+    HF_ENDPOINT: "https://huggingface.co"
+
+# GPT-5.4 — Responses API (1M context, 64K output, phase-aware)
+# Context: 1,000,000 total; MAX_TOKENS=65536 output (64K)
+# CONTEXT_WINDOW = 1,000,000 - 65,536 = 934,464 (input prune threshold; GPT tokenizer ≈ tiktoken)
+# Key improvements over GPT-5.2: 1M context, better tool use, compaction, phase support
+aisci/gpt-5.4-responses:
+  <<: *defaults
+  env_vars:
+    TIME_LIMIT_SECS: *time_limit
+    # Official OpenAI API — OpenAI() client (NOT AzureOpenAI).
+    # Do NOT set AZURE_OPENAI_ENDPOINT here; its absence triggers standard client.
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    AISCI_MODEL: "gpt-5.4"
+    AISCI_API_MODE: "responses"
+    AISCI_WEB_SEARCH: "true"
+    AISCI_REASONING_EFFORT: "high"
+    AISCI_REASONING_SUMMARY: "auto"
+    AISCI_MAX_TOKENS: "65536"
+    AISCI_CONTEXT_WINDOW: "934464"
+    AISCI_USE_PHASE: "true"
+    AISCI_MAX_STEPS: "500"
+    AISCI_IMPL_TIME: "28800"
+    AISCI_EXP_TIME: "14400"
+    AISCI_CONFIG_PROFILE: "default"
+    AISCI_REMINDER_FREQ: "5"
+    HTTP_PROXY: ""
+    HTTPS_PROXY: ""
+    http_proxy: ""
+    https_proxy: ""
+    NO_PROXY: "localhost,127.0.0.1,::1"
+    no_proxy: "localhost,127.0.0.1,::1"
+    HF_ENDPOINT: "https://huggingface.co"
+
+# GPT-5.4 debug — Responses API
+aisci/gpt-5.4-responses-debug:
+  <<: *defaults
+  env_vars:
+    TIME_LIMIT_SECS: 3600
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    AISCI_MODEL: "gpt-5.4"
+    AISCI_API_MODE: "responses"
+    AISCI_WEB_SEARCH: "true"
+    AISCI_REASONING_EFFORT: "high"
+    AISCI_REASONING_SUMMARY: "auto"
+    AISCI_MAX_TOKENS: "65536"
+    AISCI_CONTEXT_WINDOW: "934464"
+    AISCI_USE_PHASE: "true"
+    AISCI_MAX_STEPS: "50"
+    AISCI_IMPL_TIME: "1800"
+    AISCI_EXP_TIME: "1200"
+    AISCI_CONFIG_PROFILE: "debug"
+    AISCI_REMINDER_FREQ: "3"
+    HTTP_PROXY: ""
+    HTTPS_PROXY: ""
+    http_proxy: ""
+    https_proxy: ""
+    NO_PROXY: "localhost,127.0.0.1,::1"
+    no_proxy: "localhost,127.0.0.1,::1"
+    HF_ENDPOINT: "https://huggingface.co"
+
+# GPT debug — Chat Completions
+aisci/gpt-5.2-debug:
+  <<: *defaults
+  env_vars:
+    TIME_LIMIT_SECS: 3600
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+    AISCI_MODEL: "gpt-5.2-2025-12-11"
+    AISCI_API_MODE: "completions"
+    AISCI_MAX_TOKENS: "32768"
+    AISCI_CONTEXT_WINDOW: "367232"
+    AISCI_MAX_STEPS: "50"
+    AISCI_IMPL_TIME: "1800"
+    AISCI_EXP_TIME: "1200"
+    AISCI_CONFIG_PROFILE: "debug"
+    AISCI_REMINDER_FREQ: "3"
+    HTTP_PROXY: ""
+    HTTPS_PROXY: ""
+    http_proxy: ""
+    https_proxy: ""
+    NO_PROXY: "localhost,127.0.0.1,::1"
+    no_proxy: "localhost,127.0.0.1,::1"
+    HF_ENDPOINT: "https://huggingface.co"
+
+# GPT debug — Responses API
+aisci/gpt-5.2-responses-debug:
+  <<: *defaults
+  env_vars:
+    TIME_LIMIT_SECS: 3600
+    AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+    AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+    OPENAI_API_VERSION: ${{ secrets.OPENAI_API_VERSION }}
+    AISCI_MODEL: "gpt-5.2-2025-12-11"
+    AISCI_API_MODE: "responses"
+    AISCI_WEB_SEARCH: "true"
+    AISCI_REASONING_EFFORT: "high"
+    AISCI_REASONING_SUMMARY: "auto"
+    AISCI_MAX_TOKENS: "32768"
+    AISCI_CONTEXT_WINDOW: "367232"
+    AISCI_MAX_STEPS: "50"
+    AISCI_IMPL_TIME: "1800"
+    AISCI_EXP_TIME: "1200"
+    AISCI_CONFIG_PROFILE: "debug"
+    AISCI_REMINDER_FREQ: "3"
+    HTTP_PROXY: ""
+    HTTPS_PROXY: ""
+    http_proxy: ""
+    https_proxy: ""
+    NO_PROXY: "localhost,127.0.0.1,::1"
+    no_proxy: "localhost,127.0.0.1,::1"
+    HF_ENDPOINT: "https://huggingface.co"
+
+# =============================================================================
+# GLM models
+# =============================================================================
+
+# GLM-4.7 — Chat Completions API
+# Context: 200000 total; MAX_TOKENS=32768 output
+# Raw input budget:  200000 - 32768 = 167232 (in GLM token space)
+# tiktoken correction: GLM tokenizer ≈ 1.26× tiktoken → tiktoken safe threshold:
+#   167232 / 1.26 - 5000 ≈ 127700   (5K buffer, same convention as GLM regrade scripts)
+# Verification: 127700 × 1.26 + 32768 ≈ 193,490 < 200,000 ✓
+aisci/glm-4.7:
+  <<: *defaults
+  env_vars:
+    TIME_LIMIT_SECS: *time_limit
+    AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+    AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+    OPENAI_API_VERSION: ${{ secrets.OPENAI_API_VERSION }}
+    AISCI_MODEL: "glm-4.7"
+    AISCI_API_MODE: "completions"
+    AISCI_MAX_TOKENS: "32768"
+    AISCI_CONTEXT_WINDOW: "127700"
+    AISCI_MAX_STEPS: "500"
+    AISCI_IMPL_TIME: "28800"
+    AISCI_EXP_TIME: "14400"
+    AISCI_CONFIG_PROFILE: "default"
+    AISCI_REMINDER_FREQ: "5"
+    HTTP_PROXY: ""
+    HTTPS_PROXY: ""
+    http_proxy: ""
+    https_proxy: ""
+    NO_PROXY: "localhost,127.0.0.1,::1"
+    no_proxy: "localhost,127.0.0.1,::1"
+    HF_ENDPOINT: "https://huggingface.co"
+
+# GLM-4.7 debug
+aisci/glm-4.7-debug:
+  <<: *defaults
+  env_vars:
+    TIME_LIMIT_SECS: 3600
+    AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+    AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+    OPENAI_API_VERSION: ${{ secrets.OPENAI_API_VERSION }}
+    AISCI_MODEL: "glm-4.7"
+    AISCI_API_MODE: "completions"
+    AISCI_MAX_TOKENS: "32768"
+    AISCI_CONTEXT_WINDOW: "127700"
+    AISCI_MAX_STEPS: "50"
+    AISCI_IMPL_TIME: "1800"
+    AISCI_EXP_TIME: "1200"
+    AISCI_CONFIG_PROFILE: "debug"
+    AISCI_REMINDER_FREQ: "3"
+    HTTP_PROXY: ""
+    HTTPS_PROXY: ""
+    http_proxy: ""
+    https_proxy: ""
+    NO_PROXY: "localhost,127.0.0.1,::1"
+    no_proxy: "localhost,127.0.0.1,::1"
+    HF_ENDPOINT: "https://huggingface.co"
+
+# GLM-5 — Chat Completions API
+# Context: 202752 total; MAX_TOKENS=20480 output
+# Raw input budget:  202752 - 20480 = 182272 (in GLM token space)
+# tiktoken correction: GLM tokenizer ≈ 1.26× tiktoken → tiktoken safe threshold:
+#   182272 / 1.26 - 5000 ≈ 139660   (5K buffer; matches GLM regrade scripts)
+# Verification: 139660 × 1.26 + 20480 ≈ 196,051 < 202,752 ✓
+# AISCI_CLEAR_THINKING: "true" = clear each turn (recommended for GLM-5 agent); "false" = Preserved Thinking (context grows fast, often worse scores).
+aisci/glm-5:
+  <<: *defaults
+  env_vars:
+    TIME_LIMIT_SECS: *time_limit
+    AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+    AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+    OPENAI_API_VERSION: ${{ secrets.OPENAI_API_VERSION }}
+    AISCI_MODEL: "glm-5"
+    AISCI_API_MODE: "completions"
+    AISCI_MAX_TOKENS: "20480"
+    AISCI_CONTEXT_WINDOW: "139660"
+    AISCI_CLEAR_THINKING: "true"
+    AISCI_MAX_STEPS: "500"
+    AISCI_IMPL_TIME: "28800"
+    AISCI_EXP_TIME: "14400"
+    AISCI_CONFIG_PROFILE: "default"
+    AISCI_REMINDER_FREQ: "5"
+    HTTP_PROXY: ""
+    HTTPS_PROXY: ""
+    http_proxy: ""
+    https_proxy: ""
+    NO_PROXY: "localhost,127.0.0.1,::1"
+    no_proxy: "localhost,127.0.0.1,::1"
+    HF_ENDPOINT: "https://huggingface.co"
+
+# GLM-5 debug
+aisci/glm-5-debug:
+  <<: *defaults
+  env_vars:
+    TIME_LIMIT_SECS: 3600
+    AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+    AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+    OPENAI_API_VERSION: ${{ secrets.OPENAI_API_VERSION }}
+    AISCI_MODEL: "glm-5"
+    AISCI_API_MODE: "completions"
+    AISCI_MAX_TOKENS: "20480"
+    AISCI_CONTEXT_WINDOW: "139660"
+    AISCI_CLEAR_THINKING: "true"
+    AISCI_MAX_STEPS: "50"
+    AISCI_IMPL_TIME: "1800"
+    AISCI_EXP_TIME: "1200"
+    AISCI_CONFIG_PROFILE: "debug"
+    AISCI_REMINDER_FREQ: "3"
+    HTTP_PROXY: ""
+    HTTPS_PROXY: ""
+    http_proxy: ""
+    https_proxy: ""
+    NO_PROXY: "localhost,127.0.0.1,::1"
+    no_proxy: "localhost,127.0.0.1,::1"
+    HF_ENDPOINT: "https://huggingface.co"
+
+# =============================================================================
+# Gemini models
+# =============================================================================
+#
+# Gemini uses the OpenAI-compatible endpoint (CompletionsLLMClient).
+# Client: OpenAI(base_url=OPENAI_BASE_URL).  Do NOT set AZURE_OPENAI_ENDPOINT.
+#
+# Context: ~1,048,576 tokens (1M); max output per profile in AISCI_MAX_TOKENS
+#   (API allows up to 65,536 including thinking; Flash uses 20,480 to match GLM-5).
+# Tokenizer: Gemini's proprietary tokenizer. Initial estimate ≈ 1.0× tiktoken
+#   (no correction applied).  If actual ratio > 1.0 the API will return a
+#   context-length 400 error, which the retry handler converts to
+#   ContextLengthError → automatic pruning.
+#
+#   CONTEXT_WINDOW = 1,000,000 − AISCI_MAX_TOKENS (e.g. 934,464 for 65,536 out;
+#   979,520 for Flash with 20,480 out).
+#
+# Temperature: Gemini 3 strongly recommends 1.0 — lower values cause reasoning
+#   loops.  Set via AISCI_TEMPERATURE (not the default None → NOT_GIVEN).
+#
+# Reasoning: reasoning_effort is sent via extra_body (maps to thinking_level).
+#   "high" enables Dynamic Thinking (deepest).
+#
+# Thought Signatures: Gemini 3 tool_calls include extra_content with
+#   thought_signature that must be passed back.  The framework preserves this
+#   via ToolCallResult.extra_content (no model-specific code needed).
+
+# Gemini 3 Flash — Chat Completions API (OpenAI-compatible endpoint)
+# AISCI_MAX_TOKENS=20480 matches GLM-5 output cap; CONTEXT_WINDOW = 1_000_000 − 20480.
+aisci/gemini-3-flash:
+  <<: *defaults
+  env_vars:
+    TIME_LIMIT_SECS: *time_limit
+    # Same env name as other Completions agents: run scripts export OPENAI_API_KEY.
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    OPENAI_BASE_URL: "https://generativelanguage.googleapis.com/v1beta/openai/"
+    AISCI_MODEL: "gemini-3-flash-preview"
+    AISCI_API_MODE: "completions"
+    AISCI_REASONING_EFFORT: "high"
+    AISCI_TEMPERATURE: "1.0"
+    AISCI_MAX_TOKENS: "20480"
+    AISCI_CONTEXT_WINDOW: "979520"
+    AISCI_CONTEXT_REDUCE_STRATEGY: "summary"
+    AISCI_MAX_STEPS: "500"
+    AISCI_IMPL_TIME: "28800"
+    AISCI_EXP_TIME: "14400"
+    AISCI_CONFIG_PROFILE: "default"
+    AISCI_REMINDER_FREQ: "5"
+    HTTP_PROXY: ""
+    HTTPS_PROXY: ""
+    http_proxy: ""
+    https_proxy: ""
+    NO_PROXY: "localhost,127.0.0.1,::1"
+    no_proxy: "localhost,127.0.0.1,::1"
+    HF_ENDPOINT: "https://huggingface.co"
+
+# Gemini 3 Flash debug
+aisci/gemini-3-flash-debug:
+  <<: *defaults
+  env_vars:
+    TIME_LIMIT_SECS: 3600
+    # Same env name as other Completions agents: run scripts export OPENAI_API_KEY.
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    OPENAI_BASE_URL: "https://generativelanguage.googleapis.com/v1beta/openai/"
+    AISCI_MODEL: "gemini-3-flash-preview"
+    AISCI_API_MODE: "completions"
+    AISCI_REASONING_EFFORT: "high"
+    AISCI_TEMPERATURE: "1.0"
+    AISCI_MAX_TOKENS: "20480"
+    AISCI_CONTEXT_WINDOW: "979520"
+    AISCI_CONTEXT_REDUCE_STRATEGY: "summary"
+    AISCI_MAX_STEPS: "50"
+    AISCI_IMPL_TIME: "1800"
+    AISCI_EXP_TIME: "1200"
+    AISCI_CONFIG_PROFILE: "debug"
+    AISCI_REMINDER_FREQ: "3"
+    HTTP_PROXY: ""
+    HTTPS_PROXY: ""
+    http_proxy: ""
+    https_proxy: ""
+    NO_PROXY: "localhost,127.0.0.1,::1"
+    no_proxy: "localhost,127.0.0.1,::1"
+    HF_ENDPOINT: "https://huggingface.co"
+
+# Gemini 3.1 Pro — Chat Completions API (OpenAI-compatible endpoint)
+# Same context/output limits as Flash.  Thinking cannot be disabled (no
+# "minimal" level); reasoning_effort="high" is the default and recommended.
+# Significantly more expensive than Flash — use when strongest reasoning needed.
+aisci/gemini-3.1-pro:
+  <<: *defaults
+  env_vars:
+    TIME_LIMIT_SECS: *time_limit
+    # Same env name as other Completions agents: run scripts export OPENAI_API_KEY.
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    OPENAI_BASE_URL: "https://generativelanguage.googleapis.com/v1beta/openai/"
+    AISCI_MODEL: "gemini-3.1-pro-preview"
+    AISCI_API_MODE: "completions"
+    AISCI_REASONING_EFFORT: "high"
+    AISCI_TEMPERATURE: "1.0"
+    AISCI_MAX_TOKENS: "65536"
+    AISCI_CONTEXT_WINDOW: "934464"
+    AISCI_CONTEXT_REDUCE_STRATEGY: "summary"
+    AISCI_MAX_STEPS: "500"
+    AISCI_IMPL_TIME: "28800"
+    AISCI_EXP_TIME: "14400"
+    AISCI_CONFIG_PROFILE: "default"
+    AISCI_REMINDER_FREQ: "5"
+    HTTP_PROXY: ""
+    HTTPS_PROXY: ""
+    http_proxy: ""
+    https_proxy: ""
+    NO_PROXY: "localhost,127.0.0.1,::1"
+    no_proxy: "localhost,127.0.0.1,::1"
+    HF_ENDPOINT: "https://huggingface.co"
+
+# Gemini 3.1 Pro debug
+aisci/gemini-3.1-pro-debug:
+  <<: *defaults
+  env_vars:
+    TIME_LIMIT_SECS: 3600
+    # Same env name as other Completions agents: run scripts export OPENAI_API_KEY.
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    OPENAI_BASE_URL: "https://generativelanguage.googleapis.com/v1beta/openai/"
+    AISCI_MODEL: "gemini-3.1-pro-preview"
+    AISCI_API_MODE: "completions"
+    AISCI_REASONING_EFFORT: "high"
+    AISCI_TEMPERATURE: "1.0"
+    AISCI_MAX_TOKENS: "65536"
+    AISCI_CONTEXT_WINDOW: "934464"
+    AISCI_CONTEXT_REDUCE_STRATEGY: "summary"
+    AISCI_MAX_STEPS: "50"
+    AISCI_IMPL_TIME: "1800"
+    AISCI_EXP_TIME: "1200"
+    AISCI_CONFIG_PROFILE: "debug"
+    AISCI_REMINDER_FREQ: "3"
+    HTTP_PROXY: ""
+    HTTPS_PROXY: ""
+    http_proxy: ""
+    https_proxy: ""
+    NO_PROXY: "localhost,127.0.0.1,::1"
+    no_proxy: "localhost,127.0.0.1,::1"
+    HF_ENDPOINT: "https://huggingface.co"
