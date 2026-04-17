@@ -37,7 +37,8 @@
 
 - `2026-04-13`: Initial public release of AiScientist.
 - `2026-04-13`: The public README now reflects the `File-as-Bus` thesis, hierarchical research team design, and long-horizon paper/MLE workflows.
-- Future updates will include benchmarks, release notes, and project milestones.
+- `2026-04-17`: Paper released on [arXiv](https://arxiv.org/pdf/2604.13018); the **MLE-bench** benchmark is now available under `benchmark/MLE-bench`.
+- Future updates will include additional benchmarks, release notes, and project milestones.
 
 ## 🔬 What AiScientist Is
 
