@@ -1,23 +1,49 @@
-# AiScientist: A File-as-Bus Research Lab
+<h1 align="center"><img src="assets/logo.png" alt="" width="64" style="vertical-align: middle;">&nbsp; AiScientist: A File-as-Bus Research Lab</h1>
 
-**Long-horizon ML research needs File-as-Bus coordination, not just message handoffs.**  
-***Talk is cheap**, show me **your files**.*  
+<p align="center">
+  <strong>Long-horizon ML research needs File-as-Bus coordination, not just message handoffs.</strong><br />
+  <em><strong>Talk is cheap</strong>, show me <strong>your files</strong>.</em><br />
+  <!-- Hierarchical Orchestration | File-as-Bus Coordination | Thin Control over Thick State -->
+</p>
+
+<p align="center">
+  <a href="#🚀-quick-start"><img src="https://img.shields.io/badge/Quick_Start-0F766E?style=for-the-badge" alt="Quick Start" /></a>
+  <a href="#✨-why-it-feels-different"><img src="https://img.shields.io/badge/Why_File--as--Bus-111827?style=for-the-badge" alt="Why File-as-Bus" /></a>
+  <a href="#paper-track"><img src="https://img.shields.io/badge/Paper_Bench-D86A42?style=for-the-badge" alt="Paper Track" /></a>
+  <a href="#mle-track"><img src="https://img.shields.io/badge/MLE_Bench-10233F?style=for-the-badge" alt="MLE Track" /></a>
+  <a href="#💾-what-lands-on-disk"><img src="https://img.shields.io/badge/Workspace_State-F59E0B?style=for-the-badge" alt="Workspace State" /></a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/orchestration-hierarchical_research_team-0F766E" alt="Agent-as-Tool orchestration" />
+  <img src="https://img.shields.io/badge/coordination-File--as--Bus-10233F" alt="File-as-Bus coordination" />
+  <img src="https://img.shields.io/badge/control-Thin_over_Thick_State-D86A42" alt="Thin control over thick state" />
+  <img src="https://img.shields.io/badge/state-System_of_Record-F59E0B" alt="System of record" />
+</p>
 
 > AiScientist is built for long-horizon ML research engineering, where agents must maintain coherent progress across heterogeneous stages while preserving evolving project state over time.
 
-*Across a 24-hour autonomous run, AiScientist repeatedly implements, tests, keeps, and discards candidate ideas while pushing the running best upward. This trajectory shows long-horizon improvement through 78 experiment cycles, with diverse solution strategies explored along the way rather than a single lucky guess.*
+<p align="center">
+  <a href="assets/Detecting_Insults.png">
+    <img src="assets/Detecting_Insults.png" alt="Detecting Insults improvement curve" width="95%" />
+  </a>
+</p>
+
+<p align="center">
+  <em>Across a 24-hour autonomous run, AiScientist repeatedly implements, tests, keeps, and discards candidate ideas while pushing the running best upward. This trajectory shows long-horizon improvement through 78 experiment cycles, with diverse solution strategies explored along the way rather than a single lucky guess.</em>
+</p>
 
 ## 📰 News
 
 - `2026-04-17`: Released the paper on [arXiv](https://arxiv.org/pdf/2604.13018) and added benchmark integrations for `PaperBench` under `benchmark/frontier-evals` and `MLE-Bench` under `benchmark/MLE-bench`.
 - `2026-04-13`: Initial public release of AiScientist, including the `File-as-Bus` runtime model, hierarchical research-team orchestration, and long-horizon `paper` / `mle` workflows.
-- More updates will include benchmark extensions, ablations, release notes, and project milestones.
 
 ## 🔬 What AiScientist Is
 
 AiScientist is an artifact-mediated virtual research lab for long-horizon ML research engineering. It treats long-horizon performance as a joint systems problem: agents must not only orchestrate the right expertise at the right stage, but also preserve evolving project state with enough fidelity for later decisions to stay coherent.
 
 - `paper`: given a paper markdown or bundle plus a GPU and time budget, AiScientist autonomously drives the full reproduction loop from reading and planning to implementation, experimentation, debugging, and final self-check.
+
 - `mle`: given an ML task plus a GPU and time budget, AiScientist autonomously conducts research for stronger solutions through repeated implementation-and-experiment cycles that improve the target metric over time.
 
 File-as-Bus is the core coordination protocol. Instead of compressing progress into lossy conversational handoffs, AiScientist turns workspace files into the system of record for plans, code, experiments, logs, and validation artifacts.
@@ -40,45 +66,47 @@ https://github.com/user-attachments/assets/4356691b-eeb5-4766-a50b-29ddbc48ef9b
 
 ## ✨ Why It Feels Different
 
+<table align="center" width="100%">
+<tr>
+<td width="25%" align="center" style="vertical-align: top; padding: 15px;">
 
-|     |
-| --- |
-|     |
+<h3>Hierarchical Research Team</h3>
 
+<img src="assets/hierarchical.png" width="90%" alt="Hierarchical research team illustration">
 
-### Hierarchical Research Team
+<p align="center"><strong>A hierarchical research team pairs a top-level Orchestrator with specialists and focused subagents to sustain coherent progress over multi-day workloads.</strong></p>
 
-**A hierarchical research team pairs a top-level Orchestrator with specialists and focused subagents to sustain coherent progress over multi-day workloads.**
+</td>
+<td width="25%" align="center" style="vertical-align: top; padding: 15px;">
 
-### File-as-Bus Coordination
+<h3>File-as-Bus Coordination</h3>
 
-**Agents coordinate through evolved workspace files instead of relying only on lossy message handoffs between prompts.**
+<img src="assets/file-as-bus.png" width="90%" alt="File-as-Bus coordination illustration">
 
-### Workspace as System of Record
+<p align="center"><strong>Agents coordinate through evolved workspace files instead of relying only on lossy message handoffs between prompts.</strong></p>
 
-**A permission-scoped workspace and compact workspace map keep plans, code, experiments, and validation as the durable source of truth for both agents and operators.**
+</td>
+<td width="25%" align="center" style="vertical-align: top; padding: 15px;">
 
-### Thin Control over Thick State
+<h3>Workspace as System of Record</h3>
 
-**The Orchestrator keeps control thin through stage-level directives, concise summaries, and a workspace map, while specialists progressively disclose thick state by reading task-relevant artifacts on demand.**
+<img src="assets/workspace.png" width="90%" alt="Workspace as the system of record illustration">
 
-<<<<<<< HEAD
----
+<p align="center"><strong>A permission-scoped workspace and compact workspace map keep plans, code, experiments, and validation as the durable source of truth for both agents and operators.</strong></p>
 
-*A short look at AiScientist in motion.*
+</td>
+<td width="25%" align="center" style="vertical-align: top; padding: 15px;">
 
+<h3>Thin Control over Thick State</h3>
 
-|     |
-| --- |
-|     |
+<img src="assets/thin_control.png" width="90%" alt="Thin control over thick state illustration">
 
+<p align="center"><strong>The Orchestrator keeps control thin through stage-level directives, concise summaries, and a workspace map, while specialists progressively disclose thick state by reading task-relevant artifacts on demand.</strong></p>
 
-[https://github.com/user-attachments/assets/4356691b-eeb5-4766-a50b-29ddbc48ef9b](https://github.com/user-attachments/assets/4356691b-eeb5-4766-a50b-29ddbc48ef9b)
+</td>
+</tr>
+</table>
 
----
-
-=======
->>>>>>> github/main
 ## ⚙️ How It Works
 
 1. **Stage the workspace.** AiScientist stages the inputs into a permission-scoped workspace and builds a compact `workspace map` that acts as the lightweight entry point into the run state.
@@ -93,12 +121,10 @@ This is the core shift from message handoffs to `File-as-Bus` coordination: **co
 
 AiScientist uses one control plane for two long-horizon workloads: paper reproduction and Kaggle-style MLE competitions.
 
-
-| Track   | Primary entrypoints                                                                              | What the loop optimizes for                                                                                                                 | Validation endpoint                            |
-| ------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
-| `paper` | `--paper-md`, `--zip`                                                                            | turn paper context into a runnable reproduction through reading, planning, implementation, experimentation, debugging, and final self-check | final self-check plus `validation_report.json` |
-| `mle`   | exactly one of `--zip`, `--name`, `--workspace-zip`, `--competition-bundle-zip`, or `--data-dir` | search for stronger solutions through repeated implementation-and-experiment cycles that improve the target metric over time                | submission-format or grading validation        |
-
+| Track | Primary entrypoints | What the loop optimizes for | Validation endpoint |
+| --- | --- | --- | --- |
+| `paper` | `--paper-md`, `--zip` | turn paper context into a runnable reproduction through reading, planning, implementation, experimentation, debugging, and final self-check | final self-check plus `validation_report.json` |
+| `mle` | exactly one of `--zip`, `--name`, `--workspace-zip`, `--competition-bundle-zip`, or `--data-dir` | search for stronger solutions through repeated implementation-and-experiment cycles that improve the target metric over time | submission-format or grading validation |
 
 Both tracks share the same workspace model: durable files on disk become the common state that agents, operators, and validation flows can all inspect later.
 
@@ -109,6 +135,7 @@ Both tracks share the same workspace model: durable files on disk become the com
 ### MLE Track
 
 `mle` is the competition-style long-horizon ML engineering track. Starting from the most self-contained `--zip` path or a prepared-cache `--name`, AiScientist iterates through implementation-and-experiment cycles to explore stronger solutions and continuously improve the target metric over time.
+
 
 ## 🏁 Benchmark Results
 
@@ -205,17 +232,22 @@ Outside the bus, the host still preserves `logs/`, `artifacts/`, and `state/` so
 
 ## 🚀 Quick Start
 
-
-|     |
-| --- |
-|     |
-
+<table align="center" width="100%">
+<tr>
+<td width="50%" valign="top">
 
 **Environment Note**  
-The current Dockerfiles are still tuned for our operator environment. Both `[docker/paper-agent.Dockerfile](docker/paper-agent.Dockerfile)` and `[docker/mle-agent.Dockerfile](docker/mle-agent.Dockerfile)` reference internal Ubuntu images and package mirrors. If you are outside that environment, replace those base-image and mirror lines before the first build. See the full notes in the [Operator Guide](docs/operator-guide.md).
+The current Dockerfiles are still tuned for our operator environment. Both [`docker/paper-agent.Dockerfile`](docker/paper-agent.Dockerfile) and [`docker/mle-agent.Dockerfile`](docker/mle-agent.Dockerfile) reference internal Ubuntu images and package mirrors. If you are outside that environment, replace those base-image and mirror lines before the first build. See the full notes in the [Operator Guide](docs/operator-guide.md).
+
+</td>
+<td width="50%" valign="top">
 
 **Profile Note**  
-The shipped LLM defaults are not symmetric: `paper=glm-5`, `mle=gpt-5.4` in `[config/llm_profiles.yaml](config/llm_profiles.yaml)`. If you only have `OPENAI_API_KEY`, run paper commands with `--llm-profile gpt-5.4` and use `AISCI_PAPER_DOCTOR_PROFILE=gpt-5.4` for `paper doctor`, or update the default profile locally.
+The shipped LLM defaults are not symmetric: `paper=glm-5`, `mle=gpt-5.4` in [`config/llm_profiles.yaml`](config/llm_profiles.yaml). If you only have `OPENAI_API_KEY`, run paper commands with `--llm-profile gpt-5.4` and use `AISCI_PAPER_DOCTOR_PROFILE=gpt-5.4` for `paper doctor`, or update the default profile locally.
+
+</td>
+</tr>
+</table>
 
 The main README keeps only the shortest runnable happy path. For the full setup, GPU and Docker prerequisites, profile caveats, example scripts, and validation/resume flows, use the [Operator Guide](docs/operator-guide.md).
 
@@ -315,7 +347,6 @@ tests/                    host-side regression tests
 ```
 
 AiScientist is opinionated enough to run real work, but still transparent enough that you can inspect every file the lab leaves behind.
-
 ## ❤️ Acknowledgments
 
 AiScientist builds on prior work in research automation, evaluation, and ML task environments, especially:
@@ -329,10 +360,11 @@ We are grateful to the authors and maintainers of these projects for making this
 
 Released under the MIT License. See [LICENSE](LICENSE).
 
+
 ## 📬 Contact
 
 For questions, collaboration, or bug reports, please open an issue or email 📧 `gx.chen.chn@gmail.com`.
 
-#### *If AiScientist is useful in your research or engineering workflow, consider starring 🌟 the repo and citing the project.*
+<h4 align="center"><em>If AiScientist is useful in your research or engineering workflow, consider starring 🌟 the repo and citing the project.</em></h4>
 
-**[Quick Start](#quick-start) · [Two Tracks](#two-tracks) · Operator Guide**
+<p align="center"><strong><a href="#quick-start">Quick Start</a> · <a href="#two-tracks">Two Tracks</a> · <a href="docs/operator-guide.md">Operator Guide</a></strong></p>
