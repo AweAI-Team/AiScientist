@@ -22,6 +22,22 @@ AiScientist is an artifact-mediated virtual research lab for long-horizon ML res
 
 File-as-Bus is the core coordination protocol. Instead of compressing progress into lossy conversational handoffs, AiScientist turns workspace files into the system of record for plans, code, experiments, logs, and validation artifacts.
 
+---
+
+<p align="center"><em>A short look at AiScientist in motion.</em></p>
+
+<table align="center" width="82%">
+<tr>
+<td align="center">
+
+https://github.com/user-attachments/assets/4356691b-eeb5-4766-a50b-29ddbc48ef9b
+
+</td>
+</tr>
+</table>
+
+---
+
 ## ✨ Why It Feels Different
 
 
@@ -46,6 +62,7 @@ File-as-Bus is the core coordination protocol. Instead of compressing progress i
 
 **The Orchestrator keeps control thin through stage-level directives, concise summaries, and a workspace map, while specialists progressively disclose thick state by reading task-relevant artifacts on demand.**
 
+<<<<<<< HEAD
 ---
 
 *A short look at AiScientist in motion.*
@@ -60,6 +77,8 @@ File-as-Bus is the core coordination protocol. Instead of compressing progress i
 
 ---
 
+=======
+>>>>>>> github/main
 ## ⚙️ How It Works
 
 1. **Stage the workspace.** AiScientist stages the inputs into a permission-scoped workspace and builds a compact `workspace map` that acts as the lightweight entry point into the run state.
