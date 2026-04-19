@@ -367,4 +367,13 @@ For questions, collaboration, or bug reports, please open an issue or email 📧
 
 <h4 align="center"><em>If AiScientist is useful in your research or engineering workflow, consider starring 🌟 the repo and citing the project.</em></h4>
 
+```
+@article{chen2026toward,
+  title={Toward Autonomous Long-Horizon Engineering for ML Research},
+  author={Chen, Guoxin and Chen, Jie and Chen, Lei and Zhao, Jiale and Meng, Fanzhe and Zhao, Wayne Xin and Song, Ruihua and Chen, Cheng and Wen, Ji-Rong and Jia, Kai},
+  journal={arXiv preprint arXiv:2604.13018},
+  year={2026}
+}
+```
+
 <p align="center"><strong><a href="#quick-start">Quick Start</a> · <a href="#two-tracks">Two Tracks</a> · <a href="docs/operator-guide.md">Operator Guide</a></strong></p>
