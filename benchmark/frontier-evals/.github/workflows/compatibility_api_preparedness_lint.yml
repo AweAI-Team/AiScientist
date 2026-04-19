@@ -1,0 +1,50 @@
+name: Run linting on compatibility_api_preparedness
+
+on:
+  pull_request:
+    paths:
+      - 'project/common/compatibility_api_preparedness/**'
+      - 'project/common/compatibility_api/**'
+    branches:
+      - '**'
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  workflow_dispatch:
+    inputs:
+      test_branch:
+        description: 'Branch to run the tests on'
+        required: false
+        default: 'main'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: false
+        fetch-depth: 1
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+
+    - name: Install dependencies
+      working-directory: ./project/common/compatibility_api_preparedness
+      env:
+        UV_GIT_LFS: 1
+      run: |
+        uv sync
+
+    - name: run mypy
+      working-directory: ./project/common/compatibility_api_preparedness
+      run: |
+        uv run mypy compatibility_api_preparedness
+
+    - name: run ruff-strict
+      working-directory: ./project/common/compatibility_api_preparedness
+      run: |
+        uv run ruff check --output-format=github --no-fix

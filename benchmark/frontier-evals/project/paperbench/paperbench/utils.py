@@ -1,0 +1,281 @@
+import logging
+import os
+import shutil
+import subprocess
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Literal, ParamSpec, Sequence, TypeVar
+
+import blobfile as bf
+import numpy as np
+import openai
+import structlog.stdlib
+import tenacity
+import yaml
+from docker import DockerClient
+from docker.errors import DockerException
+
+logger = structlog.stdlib.get_logger(component=__name__)
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+DATA_DIR_ENV_VAR = "PAPERBENCH_DATA_DIR"
+
+
+class PaperbenchDataNotFoundError(FileNotFoundError):
+    """Raised when we cannot locate the PaperBench data directory."""
+
+    def __init__(self, candidate: Path):
+        message = (
+            "Unable to locate the PaperBench data directory.\n"
+            f"Checked: {candidate}\n"
+            "If you installed PaperBench from a git dependency, the dataset is not pulled "
+            "automatically. Set the PAPERBENCH_DATA_DIR environment variable to point to a "
+            "clone of `frontier-evals` where you've run `git lfs fetch --include "
+            '"project/paperbench/data/**" --exclude ""` (and `git lfs checkout`), or hydrate the data in '
+            "another location and point PAPERBENCH_DATA_DIR at it."
+        )
+        super().__init__(message)
+        self.candidate = candidate
+
+
+def in_ci() -> bool:
+    """Checks if the tests are running in CI."""
+
+    return os.environ.get("CI") == "true"
+
+
+def purple(text: str) -> str:
+    return f"\033[1;35m{text}\033[0m"
+
+
+def is_docker_running(timeout: float = 10.0) -> bool:
+    """Return `True` if and only if Docker is running."""
+
+    try:
+        return DockerClient(timeout=timeout).ping()
+    except DockerException:
+        return False
+
+
+def host_has_nvidia_smi(timeout: float = 5.0) -> bool:
+    """Return True if `nvidia-smi` exists on the host and exits successfully."""
+
+    nvidia_smi = shutil.which("nvidia-smi")
+    if not nvidia_smi:
+        return False
+
+    try:
+        result = subprocess.run(
+            [nvidia_smi],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+    return result.returncode == 0
+
+
+def load_yaml_dict(fpath: Path) -> dict[str, Any]:
+    """Loads a YAML file and returns its contents as a dictionary."""
+
+    assert isinstance(fpath, Path), f"Expected a `Path`, but got `{type(fpath)}`."
+    assert fpath.exists(), f"File `{fpath}` does not exist."
+    assert fpath.is_file(), f"Expected a file, but got `{fpath}`."
+    assert fpath.suffix == ".yaml", f"Expected a YAML file, but got `{fpath}`."
+
+    with open(fpath, "r") as file:
+        contents = yaml.safe_load(file)
+
+    assert isinstance(contents, dict), (
+        f"Expected to load a dictionary from YAML file, but got `{type(contents)}`."
+    )
+
+    return contents
+
+
+def get_root() -> Path:
+    """Returns an absolute path to the root of the PaperBench module."""
+
+    path = Path(__file__).parent.resolve()
+
+    assert path.name == "paperbench", (
+        f"Expected the module directory to be `paperbench`, but got `{path.name}`."
+    )
+
+    return path
+
+
+def get_paperbench_data_dir(*, require_exists: bool = True) -> Path:
+    """Returns an absolute path to the PaperBench data directory.
+
+    Args:
+        require_exists: When True (default) we raise a PaperbenchDataNotFoundError if the
+            resolved directory is missing. When False we return the candidate directory and
+            create it if an explicit override was provided.
+    """
+
+    override = os.environ.get(DATA_DIR_ENV_VAR)
+    if override:
+        override_path = Path(override).expanduser()
+        if override_path.exists():
+            return override_path
+        if not require_exists:
+            override_path.mkdir(parents=True, exist_ok=True)
+            return override_path
+        raise PaperbenchDataNotFoundError(override_path)
+
+    default_path = get_root().parent / "data"
+    if default_path.exists():
+        return default_path
+    if require_exists:
+        raise PaperbenchDataNotFoundError(default_path)
+    return default_path
+
+
+def get_agents_dir() -> Path:
+    """Returns an absolute path to the paperbench/solvers directory."""
+    return get_root() / "solvers"
+
+
+def get_agents_env_vars() -> dict[str, str]:
+    """Parses solvers' agent.env (KEY=VALUE per line) into a dictionary."""
+    agent_env_path = get_agents_dir() / "agent.env"
+    if not agent_env_path.exists():
+        logger.warning(f"agent.env not found in {agent_env_path}")
+        return {}
+    env_vars: dict[str, str] = {}
+    with open(agent_env_path, "r") as f:
+        for line in f:
+            if line.strip() and not line.startswith("#"):
+                key, value = line.strip().split("=", 1)
+                env_vars[key] = value
+    return env_vars
+
+
+def build_canonical_sub_path(run_dir: Path | str, timestamp: str) -> str:
+    """
+    The canonical place where we expect submission.tar.gz to be for repro and grading
+    """
+    return bf.join(run_dir, "submissions", timestamp, "submission.tar.gz")
+
+
+def get_experiments_dir() -> Path:
+    """Returns an absolute path to the paperbench data directory."""
+
+    return get_root().parent / "experiments"
+
+
+def find_dotenv() -> Path:
+    """Returns an absolute path to the .env file."""
+
+    return get_root().parent / ".env"
+
+
+def get_timestamp() -> str:
+    """Returns the current timestamp in the format `YYYY-MM-DDTHH-MM-SS-Z`."""
+
+    return time.strftime("%Y-%m-%dT%H-%M-%S-%Z", time.gmtime())
+
+
+def normalize_not_given(value: Literal["NOT_GIVEN"] | None) -> openai.NotGiven | None:
+    """Normalize OpenAI's NotGiven sentinel string/object to ``None``.
+
+    JSON dumps of ``openai.NotGiven`` will surface as the literal string ``"NOT_GIVEN"``
+    when using TurnCompleters. We coerce this back to the actual ``openai.NotGiven``
+    to maintain consistency with other uses of OpenAI's API.
+    """
+
+    if isinstance(value, str) and value == "NOT_GIVEN":
+        return openai.NotGiven()
+    return value
+
+
+def safe_mean(values: Sequence[float | int], default: float = np.nan) -> float:
+    """Return the mean or a default when no values are provided."""
+
+    assert isinstance(values, Sequence), "`values` must be a sequence"
+    assert all(isinstance(v, (int, float)) for v in values), "`values` must be numeric list"
+    assert isinstance(default, (int, float)), "`default` must be numeric"
+
+    if not values:
+        return float(default)
+
+    result = float(np.mean(values))
+
+    assert isinstance(result, (int, float)), (
+        f"Expected the mean to be a number, but got `{type(result)}`"
+    )
+
+    return result
+
+
+def get_commit_hash() -> str:
+    """Returns the current Git commit hash."""
+
+    return subprocess.check_output(["git", "rev-parse", "HEAD"]).strip().decode("ascii")
+
+
+def create_run_id(paper_id: str) -> str:
+    """Creates a run ID."""
+
+    return f"{paper_id}_{str(uuid.uuid4())}"
+
+
+def create_run_dir(
+    run_group: str,
+    run_id: str,
+    runs_dir: str,
+) -> str:
+    """Creates a directory for the run."""
+
+    run_dir = bf.join(runs_dir, run_group, run_id)
+    bf.makedirs(run_dir)
+    return run_dir
+
+
+def get_default_runs_dir() -> str:
+    """Returns an absolute path to the directory storing runs."""
+
+    return str(get_root().parent / "runs")
+
+
+OPENAI_TIMEOUT_EXCEPTIONS = (
+    openai.RateLimitError,
+    openai.APIConnectionError,
+    openai.APITimeoutError,
+    openai.InternalServerError,
+)
+
+
+@tenacity.retry(
+    wait=tenacity.wait_random_exponential(min=1, max=300),  # Max wait time of 5 minutes
+    stop=tenacity.stop_after_delay(3600 * 2),  # Retry for up to 2 hours
+    retry=tenacity.retry_if_exception_type(OPENAI_TIMEOUT_EXCEPTIONS),
+    before_sleep=(
+        tenacity.before_sleep_log(logger._logger, logging.WARNING) if logger._logger else None
+    ),
+    reraise=True,
+)
+async def oai_completion_with_retry_async(
+    method: Callable[P, Awaitable[R]], *args: P.args, **kwargs: P.kwargs
+) -> R:
+    return await method(*args, **kwargs)
+
+
+@tenacity.retry(
+    wait=tenacity.wait_random_exponential(min=1, max=300),  # Max wait time of 5 minutes
+    stop=tenacity.stop_after_delay(3600 * 2),  # Retry for up to 2 hours
+    retry=tenacity.retry_if_exception_type(OPENAI_TIMEOUT_EXCEPTIONS),
+    before_sleep=(
+        tenacity.before_sleep_log(logger._logger, logging.WARNING) if logger._logger else None
+    ),
+    reraise=True,
+)
+def oai_completion_with_retry(method: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+    return method(*args, **kwargs)

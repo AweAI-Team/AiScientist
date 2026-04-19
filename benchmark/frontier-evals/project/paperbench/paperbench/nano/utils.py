@@ -1,0 +1,123 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+
+import structlog.stdlib
+
+from paperbench.metrics import EvaluationRun, PaperEvaluation
+from paperbench.nano.structs import PaperBenchResult
+from paperbench.utils import get_experiments_dir
+
+logger = structlog.stdlib.get_logger(component=__name__)
+
+
+def get_split_to_expected_papers() -> dict[str, int]:
+    """
+    Reads the split files in experiments/splits and returns a dictionary
+    mapping split names to the number of papers in each split.
+    """
+    split_to_expected_papers = {}
+    splits_dir = get_experiments_dir() / "splits"
+
+    for split_file in splits_dir.glob("*.txt"):
+        split_name = split_file.stem
+        with open(split_file, "r") as f:
+            # Count non-empty lines in the file
+            papers = [line.strip() for line in f if line.strip()]
+            split_to_expected_papers[split_name] = len(papers)
+
+    return split_to_expected_papers
+
+
+SPLIT_TO_EXPECTED_PAPERS = get_split_to_expected_papers()
+
+
+def gather_eval_runs(results: list[PaperBenchResult], n_runs: int) -> list[EvaluationRun]:
+    """
+    Gathers succesfully graded results of nano/eval into a list of n_runs EvaluationRuns
+    where a single EvaluationRun does not contain more than one evaluation of the same paper.
+    """
+    seed_to_eval_run = {
+        seed: EvaluationRun(seed=seed, paper_evaluations={}) for seed in range(n_runs)
+    }
+    paper_to_cur_seed = {}
+
+    if not results:
+        return list(seed_to_eval_run.values())
+
+    for result in results:
+        if result.judge_output is None or result.judge_output.graded_task_tree is None:
+            continue
+        paper_id = result.paper_id
+        if paper_id not in paper_to_cur_seed:
+            paper_to_cur_seed[paper_id] = 0
+        seed = paper_to_cur_seed[paper_id]
+        paper_to_cur_seed[paper_id] += 1
+        paper_eval = PaperEvaluation(
+            paper_id=paper_id,
+            graded_task_node=result.judge_output.graded_task_tree,
+            paper_run_id=result.run_id,
+        )
+        seed_to_eval_run[seed].paper_evaluations[paper_id] = paper_eval
+
+    return list(seed_to_eval_run.values())
+
+
+def get_file_at_duration(files: list[str], duration_hr: int) -> dict[str, timedelta | str]:
+    """
+    Given a list of files with timestamped names, return the file closest to `duration_hr`-hours
+    after the earliest file in the list.
+    e.g.
+    ```
+    files = [
+        "path/to/file/2024-12-07T10-19-52-GMT/file.tar.gz",
+        "path/to/file/2024-12-07T10-49-55-GMT/file.tar.gz",
+        "path/to/file/2024-12-07T11-19-56-GMT/file.tar.gz",
+        "path/to/file/2024-12-07T11-49-56-GMT/step_10.tar.gz",
+        "path/to/file/2024-12-07T12-19-58-GMT/file.tar.gz",
+    ]
+    get_file_at_duration(files, 1)
+    > "path/to/file/2024-12-07T11-19-56-GMT/file.tar.gz",
+    ```
+    """
+    assert files
+    assert duration_hr >= 0
+
+    timestamps = []
+
+    for file in files:
+        parts = file.split("/")
+
+        if len(parts) < 2:
+            raise ValueError(f"Invalid path {file!r}")
+
+        ts_segment = parts[-2]
+
+        if not ts_segment:
+            raise ValueError(f"Missing timestamp in {file!r}")
+
+        ts_segment = ts_segment.replace(".tar.gz", "")
+
+        if "_step_" in ts_segment:
+            ts_segment = ts_segment.split("_step_")[0]
+
+        try:
+            dt = datetime.strptime(ts_segment, "%Y-%m-%dT%H-%M-%S-%Z")
+        except ValueError:
+            try:
+                dt = datetime.strptime(ts_segment, "%Y-%m-%dT%H-%M-%S-GMT")
+            except ValueError as exc:
+                raise ValueError(f"Timestamp not found in {file!r}") from exc
+
+        timestamps.append(dt)
+
+    earliest = min(timestamps)
+    target = earliest + timedelta(hours=duration_hr)
+
+    # Find file with timestamp closest to target
+    idx = min(range(len(timestamps)), key=lambda i: abs((timestamps[i] - target).total_seconds()))
+    logger.info(
+        f"Closest file to {duration_hr} hours after earliest file ({earliest}) is {files[idx]}"
+    )
+
+    return {"path": files[idx], "duration": timestamps[idx] - earliest}

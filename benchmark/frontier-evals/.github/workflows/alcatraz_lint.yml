@@ -1,0 +1,54 @@
+name: Run linting on alcatraz
+
+on:
+  pull_request:
+    paths:
+      - 'project/common/alcatraz/**'
+    branches:
+      - '**'
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  workflow_dispatch:
+    inputs:
+      test_branch:
+        description: 'Branch to run the tests on'
+        required: false
+        default: 'main'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: false
+        fetch-depth: 1
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+
+    - name: Install dependencies
+      working-directory: ./project/common/alcatraz
+      env:
+        UV_GIT_LFS: 1
+      run: |
+        uv sync
+
+    - name: run mypy
+      working-directory: ./project/common/alcatraz
+      run: |
+        uv run poe typecheck
+
+    - name: run ruff-strict
+      working-directory: ./project/common/alcatraz
+      run: |
+        uv run ruff check --output-format=github --no-fix
+
+    - name: run pylint (cyclic imports)
+      working-directory: ./project/common/alcatraz
+      run: |
+        uv run poe lint-extra

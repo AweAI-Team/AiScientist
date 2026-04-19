@@ -1,0 +1,90 @@
+FROM ubuntu:24.04
+
+# Optional: uncomment this block to use the Alibaba PyPI mirror when building in mainland China.
+# RUN mkdir -p /etc/pip && \
+#     printf '[global]\nindex-url = https://mirrors.aliyun.com/pypi/simple/\ntrusted-host = mirrors.aliyun.com\n' > /etc/pip.conf
+ENV HF_HUB_ETAG_TIMEOUT=120
+ENV HF_HUB_DOWNLOAD_TIMEOUT=600
+
+# Do not modify the following block of arg-env pairs. The evaluation infrastructure will
+# periodically download the contents of these directories for logging purposes.
+ENV WORKSPACE_BASE=/home
+ENV SUBMISSION_DIR=/home/submission
+ENV LOGS_DIR=/home/logs
+ENV AGENT_DIR=/home/agent
+
+ENV REQUIREMENTS=/home/agent/requirements.txt
+ENV PYTHON_VERSION=3.12
+
+RUN mkdir -p ${LOGS_DIR} ${AGENT_DIR} ${SUBMISSION_DIR}
+RUN mkdir -p ${WORKSPACE_BASE}/paper
+
+RUN mkdir ${WORKSPACE_BASE}/.vscode
+COPY paperbench/solvers/launch.json ${WORKSPACE_BASE}/.vscode/launch.json
+
+# Avoid interactive dialog from apt-get and other packages requiring configuration
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install basic packages
+RUN apt-get update && apt-get install -y \
+    curl \
+    wget \
+    git \
+    vim \
+    nano \
+    unzip \
+    zip \
+    p7zip-full \
+    python3 \
+    python3-pip \
+    python3-venv \
+    python3-dev \
+    python-is-python3 \
+    build-essential \
+    openssh-server \
+    tmux \
+    gettext \
+    sudo \
+    ffmpeg \
+    libsm6 \
+    libxext6 \
+    libgl1 \
+    && rm -rf /var/lib/apt/lists/* # removes cache
+
+# Install Julia 1.10 LTS (required by sbibm for ODE simulators like Lotka-Volterra, SIR)
+ENV JULIA_VERSION=1.10.7
+RUN curl -fsSL "https://julialang-s3.julialang.org/bin/linux/x64/1.10/julia-${JULIA_VERSION}-linux-x86_64.tar.gz" | \
+    tar -xz -C /usr/local && \
+    ln -s /usr/local/julia-${JULIA_VERSION}/bin/julia /usr/local/bin/julia
+
+RUN apt update && apt install -y jupyter
+
+# Install Docker
+RUN curl -fsSL https://get.docker.com -o /tmp/get-docker.sh && \
+    chmod 700 /tmp/get-docker.sh && \
+    /tmp/get-docker.sh
+
+# Reset DEBIAN_FRONTEND
+ENV DEBIAN_FRONTEND=
+
+WORKDIR /home
+
+# Initialize submission directory as git repo and set up hooks
+RUN cd ${SUBMISSION_DIR} && \
+    git init && \
+    mkdir -p .git/hooks
+
+COPY paperbench/solvers/pre-commit ${SUBMISSION_DIR}/.git/hooks/
+RUN chmod +x ${SUBMISSION_DIR}/.git/hooks/pre-commit
+
+# Set up git config
+RUN git config --global user.email "agent@example.com" && \
+    git config --global user.name "agent"
+
+# Set up apply_patch
+COPY paperbench/solvers/apply_patch.py ${AGENT_DIR}/apply_patch.py
+RUN echo "#!/bin/bash\npython ${AGENT_DIR}/apply_patch.py '$@'" > /bin/apply_patch
+RUN chmod +x /bin/apply_patch
+
+# for grading on the computer:
+RUN mkdir -p /submission /output

@@ -1,0 +1,37 @@
+[project]
+name = "nanoeval"
+version = "0.1.0"
+dependencies = [
+    "chz",
+    "aiodebug",
+    "aiomonitor",
+    "jinja2",
+    "litecli",
+    "matplotlib",
+    "more-itertools",
+    "openai",
+    "pandas",
+    "blobfile",
+    "boostedblob",
+    "ptpython",
+    "pyarrow",
+    "pydantic>=2",
+    "streamlit",
+    "tqdm",
+    "loky",
+    "numpy",
+    "pytest-asyncio",
+    "dill",
+    "typing-extensions",
+    "pydantic-core",
+    "psutil",
+    "ipython",
+    "structlog",
+]
+
+[tool.setuptools]
+packages = { find = { include = ["nanoeval", "nanoeval.*"] } }
+
+[build-system]
+requires = ["setuptools<78.0.0", "wheel"]
+build-backend = "setuptools.build_meta"

@@ -1,0 +1,51 @@
+[project]
+name = "preparedness_turn_completer"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "openai==1.99.9",
+    "tenacity",
+    "chz",
+    "structlog",
+    "tiktoken",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.15.0",
+    "poethepoet>=0.34.0",
+    "pre-commit>=4.2.0",
+    "pytest>=8.4.1",
+    "pytest-xdist[psutil]>=3.8.0",
+    "ruff>=0.11.10",
+]
+
+[tool.setuptools]
+packages = { find = { include = ["preparedness_turn_completer", "preparedness_turn_completer.*"] } }
+
+[tool.pyright]
+typeCheckingMode = "off"                                   # we use mypy
+
+[tool.mypy]
+strict = true
+local_partial_types = true
+# These two make life easier if you use a lot of untyped libraries:
+warn_return_any = false
+allow_untyped_calls = true
+# Do not use `ignore_missing_imports`, instead use:
+disable_error_code = ["import-untyped"]
+# If you don't want to force use of type annotations:
+# allow_incomplete_defs = true
+# allow_untyped_defs = true
+# allow_any_generics = true
+
+[tool.poe.tasks]
+lint = "ruff check --fix"
+typecheck = "mypy preparedness_turn_completer"
+
+[build-system]
+requires = ["setuptools<78.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

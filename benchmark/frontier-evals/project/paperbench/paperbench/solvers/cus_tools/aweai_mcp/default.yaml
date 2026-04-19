@@ -1,0 +1,10 @@
+agent_llm_configs:
+  glm_5:
+    client_type: 'AzureOpenAI'
+    client_args:
+      azure_endpoint: ''
+      api_version: ''
+      api_key: ''
+    request_args:
+      model: 'glm-5'
+      max_completion_tokens: 65536
