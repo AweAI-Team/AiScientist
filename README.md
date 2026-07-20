@@ -380,4 +380,4 @@ For questions, collaboration, or bug reports, please open an issue or email 📧
 
 ## 🎗️ Supporters
 
-This project is supported by [RUC AIBox](https://github.com/RUCAIBox).
+This project is mainly developed and maintained by students from [RUC AIBox](https://github.com/RUCAIBox).
