@@ -377,3 +377,7 @@ For questions, collaboration, or bug reports, please open an issue or email 📧
 ```
 
 <p align="center"><strong><a href="#quick-start">Quick Start</a> · <a href="#two-tracks">Two Tracks</a> · <a href="docs/operator-guide.md">Operator Guide</a></strong></p>
+
+## 🎗️ Supporters
+
+This project is supported by [RUC AIBox](https://github.com/RUCAIBox).
